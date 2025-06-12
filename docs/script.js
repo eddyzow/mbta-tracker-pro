@@ -24,7 +24,7 @@ document.addEventListener("DOMContentLoaded", function () {
   const loadingOverlay = getEl("loading-overlay");
 
   // --- SOCKET.IO CONNECTION ---
-  const socket = io("localhost:3000", {
+  const socket = io("eddyzow.herokuapp.com", {
     transports: ["websocket"],
   });
 
