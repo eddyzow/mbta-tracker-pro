@@ -36,6 +36,13 @@ document.addEventListener("DOMContentLoaded", function () {
     console.log("Connected to server via Socket.IO");
     startUpdateTimer();
     socket.emit("request-initial-data");
+    // Request static route data from server
+    socket.emit("request-initial-route-data");
+  });
+
+  // Listen for the static route data from the server
+  socket.on("mbta-route-data", (data) => {
+    processRouteData(data);
   });
 
   socket.on("disconnect", () => {
@@ -104,7 +111,7 @@ document.addEventListener("DOMContentLoaded", function () {
   };
 
   /**
-   * [FIX] Defines the missing formatRelativeTime function.
+   * Defines the missing formatRelativeTime function.
    * Converts an ISO date string to a human-readable relative time.
    * @param {string} isoString - The ISO 8601 date string to convert.
    * @returns {string} A string like "just now", "5m ago", etc.
@@ -206,65 +213,36 @@ document.addEventListener("DOMContentLoaded", function () {
   };
 
   // --- DATA & API FUNCTIONS ---
-  const fetchAllRouteData = async () => {
-    const tempApiKey = "6215b37167cf400d86ebbd2dd4182fdf";
-    try {
-      const response = await fetch(
-        `https://api-v3.mbta.com/routes?filter[type]=0,1,2,4&api_key=${tempApiKey}`
-      );
-      routeDataCache = (await handleApiError(response)).data;
-      const infoPromises = routeDataCache.map((route) =>
-        fetchRouteInfo(route.id, tempApiKey)
-      );
-      await Promise.all(infoPromises);
-      routeDataCache.forEach((route) => {
-        const info = routeInfoCache.get(route.id);
-        if (info) drawRoute(route.id, info, true);
-      });
-      displayList("Subway");
-    } catch (error) {
-      handleFetchError(error);
-    }
-  };
+  const processRouteData = (data) => {
+    routeDataCache = data;
+    data.forEach((route) => {
+      // Populate routeInfoCache
+      const routeInfo = {
+        stops: route.stops || [],
+        shapes: route.shapes || [],
+      };
+      routeInfoCache.set(route.id, routeInfo);
 
-  const fetchRouteInfo = async (routeId, apiKey) => {
-    if (routeInfoCache.has(routeId)) return routeInfoCache.get(routeId);
-    try {
-      const shapesPromise = fetch(
-        `https://api-v3.mbta.com/shapes?filter[route]=${routeId}&include=stops&api_key=${apiKey}`
-      ).then(handleApiError);
-      const stopsPromise = fetch(
-        `https://api-v3.mbta.com/stops?filter[route]=${routeId}&api_key=${apiKey}`
-      ).then(handleApiError);
-      const [shapesData, stopsData] = await Promise.all([
-        shapesPromise,
-        stopsPromise,
-      ]);
-
-      if (stopsData && stopsData.data) {
-        stopsData.data.forEach((stop) => {
+      // Populate stationToRoutesMap
+      if (route.stops) {
+        route.stops.forEach((stop) => {
           const { name, latitude, longitude } = stop.attributes;
           const existing = stationToRoutesMap.get(name) || {
             routes: new Set(),
             id: stop.id,
             location: L.latLng(latitude, longitude),
           };
-          existing.routes.add(routeId);
+          existing.routes.add(route.id);
           stationToRoutesMap.set(name, existing);
         });
       }
 
-      const routeInfo = {
-        stops: stopsData.data || [],
-        shapes: shapesData.data || [],
-      };
-      routeInfoCache.set(routeId, routeInfo);
-      return routeInfo;
-    } catch (error) {
-      console.error(`Failed to fetch info for route ${routeId}`, error);
-      routeInfoCache.set(routeId, { stops: [], shapes: [] });
-      return { stops: [], shapes: [] };
-    }
+      // Draw the route on the map
+      drawRoute(route.id, routeInfo, true);
+    });
+
+    // Display the initial list
+    displayList("Subway");
   };
 
   // --- UI & PLOTTING ---
@@ -640,39 +618,33 @@ document.addEventListener("DOMContentLoaded", function () {
   };
 
   const fetchAndDisplayPredictions = async (stationId) => {
-    const tempApiKey = "6215b37167cf400d86ebbd2dd4182fdf";
     const predictionListEl = getEl("prediction-list");
     if (!predictionListEl) return;
 
-    try {
-      const response = await fetch(
-        `https://api-v3.mbta.com/predictions?filter[stop]=${stationId}&include=trip,route&sort=arrival_time&page[limit]=10&api_key=${tempApiKey}`
-      );
-      const predictionData = await handleApiError(response);
-
-      if (predictionData.data.length === 0) {
-        predictionListEl.innerHTML = "No upcoming arrivals.";
-        return;
-      }
-
+    // Listen for the prediction data for this specific station
+    socket.once(`prediction-data-${stationId}`, (predictionData) => {
       const lookup = new Map(
-        predictionData.included.map((item) => [item.id, item])
+        predictionData.included?.map((item) => [item.id, item]) || []
       );
       const predictionsByDirection = {};
 
       predictionData.data.forEach((prediction) => {
-        const tripId = prediction.relationships.trip.data.id;
+        const tripId = prediction.relationships.trip.data?.id;
         const trip = lookup.get(tripId);
-        if (!trip) return;
-
-        const directionId = trip.attributes.direction_id;
-        const destination = trip.attributes.headsign;
-        const routeId = prediction.relationships.route.data.id;
-        const { color } = getRouteStyle(routeId);
+        if (!trip || !trip.attributes.headsign) {
+          return;
+        }
 
         const arrivalTime =
           prediction.attributes.arrival_time ||
           prediction.attributes.departure_time;
+
+        const directionId = trip.attributes.direction_id;
+        const destination = trip.attributes.headsign;
+        const routeId = prediction.relationships.route.data?.id;
+        if (!routeId) return;
+
+        const { color } = getRouteStyle(routeId);
 
         const key = `${destination}-${directionId}`;
         if (!predictionsByDirection[key]) {
@@ -682,34 +654,45 @@ document.addEventListener("DOMContentLoaded", function () {
             arrivals: [],
           };
         }
-        predictionsByDirection[key].arrivals.push(
-          formatArrivalTime(arrivalTime)
-        );
+
+        if (arrivalTime) {
+          predictionsByDirection[key].arrivals.push(
+            formatArrivalTime(arrivalTime)
+          );
+        }
       });
 
-      let html = '<ul class="space-y-2">';
-      for (const key in predictionsByDirection) {
-        const group = predictionsByDirection[key];
-        html += `
-                    <li class="border-b pb-1">
-                        <div class="font-bold flex items-center">
-                            <span class="w-3 h-3 rounded-full mr-2" style="background-color: ${
-                              group.color
-                            }"></span>
-                            To: ${group.destination}
-                        </div>
-                        <div class="pl-5 text-gray-700">${group.arrivals.join(
-                          ", "
-                        )}</div>
-                    </li>
-                `;
+      const validGroups = Object.values(predictionsByDirection).filter(
+        (group) => group.arrivals.length > 0
+      );
+
+      if (validGroups.length === 0) {
+        predictionListEl.innerHTML = "No upcoming arrivals.";
+        return;
       }
+
+      let html = '<ul class="space-y-2">';
+      validGroups.forEach((group) => {
+        html += `
+                        <li class="border-b pb-1">
+                            <div class="font-bold flex items-center">
+                                <span class="w-3 h-3 rounded-full mr-2" style="background-color: ${
+                                  group.color
+                                }"></span>
+                                To: ${group.destination}
+                            </div>
+                            <div class="pl-5 text-gray-700">${group.arrivals.join(
+                              ", "
+                            )}</div>
+                        </li>
+                    `;
+      });
       html += "</ul>";
       predictionListEl.innerHTML = html;
-    } catch (error) {
-      console.error("Failed to fetch predictions:", error);
-      predictionListEl.innerHTML = "Could not load arrivals.";
-    }
+    });
+
+    // Request the prediction data from the server
+    socket.emit("request-predictions", stationId);
   };
 
   const showLineInfo = (routeId) => {
@@ -1096,7 +1079,4 @@ document.addEventListener("DOMContentLoaded", function () {
       }
     });
   }
-
-  // --- INITIALIZATION ---
-  fetchAllRouteData();
 });
