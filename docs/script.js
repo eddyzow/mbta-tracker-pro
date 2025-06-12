@@ -24,14 +24,14 @@ document.addEventListener("DOMContentLoaded", function () {
   const loadingOverlay = getEl("loading-overlay");
 
   // --- SOCKET.IO CONNECTION ---
-  const socket = io("eddyzow.herokuapp.com", {
+  const socket = io("https://eddyzow.net", {
     transports: ["websocket"],
   });
 
   socket.on("connect", () => {
     console.log("Connected to server via Socket.IO");
     startUpdateTimer();
-    socket.emit("request-initial-data"); // Request data immediately on connect
+    socket.emit("request-initial-data");
   });
 
   socket.on("disconnect", () => {
@@ -42,7 +42,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
   socket.on("mbta-vehicle-update", (data) => {
     allVehicleData = data;
-    lastUpdateTime = Date.now(); // Reset timer on update
+    lastUpdateTime = Date.now();
     if (selectedRouteId) {
       const routeVehicles = allVehicleData.vehicles.filter(
         (v) => v.relationships.route.data.id === selectedRouteId
@@ -93,13 +93,15 @@ document.addEventListener("DOMContentLoaded", function () {
     listContainer.innerHTML = `<p class="text-center text-red-500 p-4">Failed to load data. Please check your connection and API key.</p>`;
   };
 
-  const formatRelativeTime = (isoString) => {
-    if (!isoString) return "";
-    const date = new Date(isoString);
+  const formatArrivalTime = (time) => {
+    if (!time) return "N/A";
+    const date = new Date(time);
     const now = new Date();
-    const diffSeconds = Math.round((now - date) / 1000);
-    if (diffSeconds < 60) return `${diffSeconds}s ago`;
-    return `${Math.round(diffSeconds / 60)} min ago`;
+    const diffMinutes = Math.round((date - now) / 60000);
+
+    if (diffMinutes < 1) return "Arriving";
+    if (diffMinutes === 1) return "1 min";
+    return `${diffMinutes} min`;
   };
 
   const getRouteStyle = (routeId) => {
@@ -165,7 +167,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
   // --- DATA & API FUNCTIONS ---
   const fetchAllRouteData = async () => {
-    const tempApiKey = "6215b37167cf400d86ebbd2dd4182fdf"; // This can be proxied later too
+    const tempApiKey = "6215b37167cf400d86ebbd2dd4182fdf";
     try {
       const response = await fetch(
         `https://api-v3.mbta.com/routes?filter[type]=0,1,2,4&api_key=${tempApiKey}`
@@ -435,7 +437,7 @@ document.addEventListener("DOMContentLoaded", function () {
     vehicles.forEach((vehicle) => {
       const { latitude, longitude, label, bearing } = vehicle.attributes;
       const routeId = vehicle.relationships.route.data.id;
-      const { color } = getRouteStyle(routeId);
+      const { color, type } = getRouteStyle(routeId);
       const isActive = vehicle.id === selectedVehicleId;
       const vehicleSVG = `<svg class="vehicle-icon-svg ${
         isActive ? "active" : ""
@@ -457,7 +459,16 @@ document.addEventListener("DOMContentLoaded", function () {
       const tooltipText = isDeveloperMode
         ? vehicle.id
         : `Train ${label || vehicle.id}`;
-      marker.bindTooltip(tooltipText, { className: "station-label-tooltip" });
+      const tooltipOptions = {
+        className: "station-label-tooltip",
+        permanent: type === "Commuter Rail",
+        direction: "right",
+        offset: [12, 0],
+      };
+      if (type === "Commuter Rail")
+        tooltipOptions.className += " cr-vehicle-tooltip";
+
+      marker.bindTooltip(tooltipText, tooltipOptions);
 
       marker.on("click", (e) => {
         L.DomEvent.stop(e);
@@ -539,29 +550,26 @@ document.addEventListener("DOMContentLoaded", function () {
   };
 
   const showStationInfo = (stationName, shouldSelectLine = true) => {
-    if (shouldSelectLine) {
-      const servicingData = stationToRoutesMap.get(stationName);
-      if (servicingData && servicingData.routes.size > 0) {
-        const primaryRoute =
-          Array.from(servicingData.routes).find((r) => !r.startsWith("CR-")) ||
-          Array.from(servicingData.routes)[0];
-        const routeType = getRouteType(primaryRoute);
-        const systemVisible = querySel(
-          `.system-toggle[data-system="${routeType}"]`
-        ).checked;
-        if (systemVisible) {
-          selectRoute(primaryRoute, false);
-        } else {
-          deselectAll();
-        }
-      }
-    }
-
     const servicingData = stationToRoutesMap.get(stationName);
     if (!servicingData) return;
 
+    if (shouldSelectLine) {
+      const primaryRoute =
+        Array.from(servicingData.routes).find((r) => !r.startsWith("CR-")) ||
+        Array.from(servicingData.routes)[0];
+      const routeType = getRouteType(primaryRoute);
+      const systemVisible = querySel(
+        `.system-toggle[data-system="${routeType}"]`
+      ).checked;
+      if (systemVisible) {
+        selectRoute(primaryRoute, false);
+      } else {
+        deselectAll();
+      }
+    }
+
     const title = isDeveloperMode ? servicingData.id : stationName;
-    const content = Array.from(servicingData.routes)
+    const routeListHtml = Array.from(servicingData.routes)
       .map((routeId) => {
         const { color } = getRouteStyle(routeId);
         const name = isDeveloperMode
@@ -572,17 +580,94 @@ document.addEventListener("DOMContentLoaded", function () {
       })
       .join("");
 
-    showInfoPanel(
-      stationInfoOverlay,
-      title,
-      `<div class="space-y-1">${content}</div>`,
-      () => deselectAll()
-    );
+    const content = `
+            <div class="space-y-1">${routeListHtml}</div>
+            <div class="mt-3">
+                <h5 class="font-bold text-sm">Upcoming Arrivals</h5>
+                <div id="prediction-list" class="mt-1 text-xs">Loading...</div>
+            </div>`;
+
+    showInfoPanel(stationInfoOverlay, title, content, () => deselectAll());
+    fetchAndDisplayPredictions(servicingData.id);
+
     if (servicingData.location) {
       map.flyTo(servicingData.location, Math.max(map.getZoom(), 16), {
         animate: true,
         duration: 0.5,
       });
+    }
+  };
+
+  const fetchAndDisplayPredictions = async (stationId) => {
+    const tempApiKey = "6215b37167cf400d86ebbd2dd4182fdf"; // This should be proxied
+    const predictionListEl = getEl("prediction-list");
+    if (!predictionListEl) return;
+
+    try {
+      const response = await fetch(
+        `https://api-v3.mbta.com/predictions?filter[stop]=${stationId}&include=trip,route&sort=arrival_time&page[limit]=10&api_key=${tempApiKey}`
+      );
+      const predictionData = await handleApiError(response);
+
+      if (predictionData.data.length === 0) {
+        predictionListEl.innerHTML = "No upcoming arrivals.";
+        return;
+      }
+
+      const lookup = new Map(
+        predictionData.included.map((item) => [item.id, item])
+      );
+      const predictionsByDirection = {};
+
+      predictionData.data.forEach((prediction) => {
+        const tripId = prediction.relationships.trip.data.id;
+        const trip = lookup.get(tripId);
+        if (!trip) return;
+
+        const directionId = trip.attributes.direction_id;
+        const destination = trip.attributes.headsign;
+        const routeId = prediction.relationships.route.data.id;
+        const { color } = getRouteStyle(routeId);
+
+        const arrivalTime =
+          prediction.attributes.arrival_time ||
+          prediction.attributes.departure_time;
+
+        const key = `${destination}-${directionId}`;
+        if (!predictionsByDirection[key]) {
+          predictionsByDirection[key] = {
+            destination: destination,
+            color: color,
+            arrivals: [],
+          };
+        }
+        predictionsByDirection[key].arrivals.push(
+          formatArrivalTime(arrivalTime)
+        );
+      });
+
+      let html = '<ul class="space-y-2">';
+      for (const key in predictionsByDirection) {
+        const group = predictionsByDirection[key];
+        html += `
+                    <li class="border-b pb-1">
+                        <div class="font-bold flex items-center">
+                            <span class="w-3 h-3 rounded-full mr-2" style="background-color: ${
+                              group.color
+                            }"></span>
+                            To: ${group.destination}
+                        </div>
+                        <div class="pl-5 text-gray-700">${group.arrivals.join(
+                          ", "
+                        )}</div>
+                    </li>
+                `;
+      }
+      html += "</ul>";
+      predictionListEl.innerHTML = html;
+    } catch (error) {
+      console.error("Failed to fetch predictions:", error);
+      predictionListEl.innerHTML = "Could not load arrivals.";
     }
   };
 
@@ -796,13 +881,15 @@ document.addEventListener("DOMContentLoaded", function () {
       });
     }
 
+    if (shouldShowInfo) {
+      showLineInfo(routeId);
+    }
     // Use existing data from socket to populate immediately
     const routeVehicles = allVehicleData.vehicles.filter(
       (v) => v.relationships.route.data.id === routeId
     );
     plotVehicles(routeVehicles, allVehicleData.included);
     if (shouldShowInfo) {
-      showLineInfo(routeId);
       updateLineInfoVehicleList(
         routeId,
         routeVehicles,
