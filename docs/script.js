@@ -5,6 +5,7 @@ document.addEventListener("DOMContentLoaded", function () {
   let allVehicleData = { vehicles: [], included: [] };
   let lastUpdateTime = Date.now();
   let updateTimerInterval;
+  let isInitialVehicleDataLoaded = false;
 
   // --- DOM REFERENCES ---
   const getEl = (id) => document.getElementById(id);
@@ -43,6 +44,12 @@ document.addEventListener("DOMContentLoaded", function () {
   socket.on("mbta-vehicle-update", (data) => {
     allVehicleData = data;
     lastUpdateTime = Date.now();
+
+    if (!isInitialVehicleDataLoaded) {
+      if (loadingOverlay) loadingOverlay.classList.add("hidden");
+      isInitialVehicleDataLoaded = true;
+    }
+
     if (selectedRouteId) {
       const routeVehicles = allVehicleData.vehicles.filter(
         (v) => v.relationships.route.data.id === selectedRouteId
@@ -184,8 +191,6 @@ document.addEventListener("DOMContentLoaded", function () {
       displayList("Subway");
     } catch (error) {
       handleFetchError(error);
-    } finally {
-      if (loadingOverlay) loadingOverlay.classList.add("hidden");
     }
   };
 
@@ -550,23 +555,26 @@ document.addEventListener("DOMContentLoaded", function () {
   };
 
   const showStationInfo = (stationName, shouldSelectLine = true) => {
-    const servicingData = stationToRoutesMap.get(stationName);
-    if (!servicingData) return;
-
     if (shouldSelectLine) {
-      const primaryRoute =
-        Array.from(servicingData.routes).find((r) => !r.startsWith("CR-")) ||
-        Array.from(servicingData.routes)[0];
-      const routeType = getRouteType(primaryRoute);
-      const systemVisible = querySel(
-        `.system-toggle[data-system="${routeType}"]`
-      ).checked;
-      if (systemVisible) {
-        selectRoute(primaryRoute, false);
-      } else {
-        deselectAll();
+      const servicingData = stationToRoutesMap.get(stationName);
+      if (servicingData && servicingData.routes.size > 0) {
+        const primaryRoute =
+          Array.from(servicingData.routes).find((r) => !r.startsWith("CR-")) ||
+          Array.from(servicingData.routes)[0];
+        const routeType = getRouteType(primaryRoute);
+        const systemVisible = querySel(
+          `.system-toggle[data-system="${routeType}"]`
+        ).checked;
+        if (systemVisible) {
+          selectRoute(primaryRoute, false);
+        } else {
+          deselectAll();
+        }
       }
     }
+
+    const servicingData = stationToRoutesMap.get(stationName);
+    if (!servicingData) return;
 
     const title = isDeveloperMode ? servicingData.id : stationName;
     const routeListHtml = Array.from(servicingData.routes)
@@ -599,7 +607,7 @@ document.addEventListener("DOMContentLoaded", function () {
   };
 
   const fetchAndDisplayPredictions = async (stationId) => {
-    const tempApiKey = "6215b37167cf400d86ebbd2dd4182fdf"; // This should be proxied
+    const tempApiKey = "6215b37167cf400d86ebbd2dd4182fdf";
     const predictionListEl = getEl("prediction-list");
     if (!predictionListEl) return;
 
@@ -884,7 +892,7 @@ document.addEventListener("DOMContentLoaded", function () {
     if (shouldShowInfo) {
       showLineInfo(routeId);
     }
-    // Use existing data from socket to populate immediately
+
     const routeVehicles = allVehicleData.vehicles.filter(
       (v) => v.relationships.route.data.id === routeId
     );

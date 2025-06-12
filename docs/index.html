@@ -1,7 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
   <head>
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MBTA Real-Time Tracker</title>
@@ -22,6 +21,17 @@
   </head>
 
   <body class="bg-gray-100 text-gray-800">
+    <!-- Initial Loading Overlay -->
+    <div id="loading-overlay">
+      <div
+        class="spinner"
+        style="width: 48px; height: 48px; border-width: 4px"
+      ></div>
+      <p class="mt-6 text-lg font-semibold text-gray-100">
+        Loading Map Data...
+      </p>
+    </div>
+
     <div class="flex h-screen">
       <!-- Sidebar -->
       <aside
@@ -153,15 +163,6 @@
           id="vehicle-info-overlay"
           class="info-overlay top-right hidden"
         ></div>
-
-        <!-- Developer Mode Toggle -->
-        <div id="dev-mode-container">
-          <span class="text-xs font-bold mr-2">Dev Mode</span>
-          <label class="slider-switch">
-            <input type="checkbox" id="dev-mode-toggle" />
-            <span class="slider-thumb"></span>
-          </label>
-        </div>
       </main>
     </div>
 
@@ -205,9 +206,8 @@
 
           <h4 class="font-semibold">About the Creator:</h4>
           <p>
-            This app was built by Eddy Zhao (@eddyzow) as a project to provide a
-            useful tool for the Boston community. Disclaimer: generative AI was
-            used to navigate some complex tasks. I hope you enjoy it!
+            This app was built by [Your Name Here] as a project to provide a
+            useful tool for the Boston community. I hope you enjoy it!
           </p>
         </div>
         <div class="mt-5 sm:mt-6">
@@ -216,7 +216,17 @@
       </div>
     </div>
 
+    <!-- Developer Mode Toggle (fixed position) -->
+    <div id="dev-mode-container">
+      <span class="text-xs font-bold mr-2">Dev Mode</span>
+      <label class="slider-switch">
+        <input type="checkbox" id="dev-mode-toggle" />
+        <span class="slider-thumb"></span>
+      </label>
+    </div>
+
     <!-- JS Libraries -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script
       src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
       integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
