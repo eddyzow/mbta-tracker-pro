@@ -25,7 +25,10 @@ document.addEventListener("DOMContentLoaded", function () {
   const loadingOverlay = getEl("loading-overlay");
 
   // --- SOCKET.IO CONNECTION ---
-  const socket = io("https://eddyzow.herokuapp.com", {
+  // Note: This assumes a local server is running on localhost:3000
+  // to proxy requests and manage websockets. This will not work in a
+  // static environment without that server.
+  const socket = io("eddyzow.herokuapp.com", {
     transports: ["websocket"],
   });
 
@@ -98,6 +101,36 @@ document.addEventListener("DOMContentLoaded", function () {
     console.error("Fetch Error:", error);
     if (loadingRoutesEl) loadingRoutesEl.classList.add("hidden");
     listContainer.innerHTML = `<p class="text-center text-red-500 p-4">Failed to load data. Please check your connection and API key.</p>`;
+  };
+
+  /**
+   * [FIX] Defines the missing formatRelativeTime function.
+   * Converts an ISO date string to a human-readable relative time.
+   * @param {string} isoString - The ISO 8601 date string to convert.
+   * @returns {string} A string like "just now", "5m ago", etc.
+   */
+  const formatRelativeTime = (isoString) => {
+    if (!isoString) return "N/A";
+    const now = new Date();
+    const past = new Date(isoString);
+    const secondsPast = Math.round((now.getTime() - past.getTime()) / 1000);
+
+    if (secondsPast < 5) {
+      return "just now";
+    }
+    if (secondsPast < 60) {
+      return `${secondsPast}s ago`;
+    }
+    const minutesPast = Math.floor(secondsPast / 60);
+    if (minutesPast < 60) {
+      return `${minutesPast}m ago`;
+    }
+    const hoursPast = Math.floor(minutesPast / 60);
+    if (hoursPast < 24) {
+      return `${hoursPast}h ago`;
+    }
+    const daysPast = Math.floor(hoursPast / 24);
+    return `${daysPast}d ago`;
   };
 
   const formatArrivalTime = (time) => {
