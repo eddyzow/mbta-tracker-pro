@@ -1,40 +1,10 @@
 document.addEventListener("DOMContentLoaded", function () {
   // --- CONFIGURATION & STATE ---
-  // The API_KEY is now on the server.
-  let countdownInterval;
   let routeDataCache, selectedVehicleId, selectedRouteId, lastClickedShapeId;
   let isDeveloperMode = false;
-  let allVehicleData = { vehicles: [], included: [] }; // Cache for all live vehicle data
-
-  // --- SOCKET.IO CONNECTION ---
-  // Connect to your server
-  const socket = io("https://eddyzow.herokuapp.com");
-
-  socket.on("connect", () => {
-    console.log("Connected to server via Socket.IO");
-  });
-
-  // Listen for vehicle updates from the server
-  socket.on("mbta-vehicle-update", (data) => {
-    allVehicleData = data; // Store the latest data
-    if (selectedRouteId) {
-      // If a route is selected, update the map immediately
-      const routeVehicles = allVehicleData.vehicles.filter(
-        (v) => v.relationships.route.data.id === selectedRouteId
-      );
-      plotVehicles(routeVehicles, allVehicleData.included);
-      updateLineInfoVehicleList(
-        selectedRouteId,
-        routeVehicles,
-        allVehicleData.included
-      );
-    }
-  });
-
-  // Caching maps
-  const routeInfoCache = new Map();
-  const stationToRoutesMap = new Map();
-  const allRouteLayers = new Map();
+  let allVehicleData = { vehicles: [], included: [] };
+  let lastUpdateTime = Date.now();
+  let updateTimerInterval;
 
   // --- DOM REFERENCES ---
   const getEl = (id) => document.getElementById(id);
@@ -51,6 +21,45 @@ document.addEventListener("DOMContentLoaded", function () {
   const loadingRoutesEl = getEl("loading-routes");
   const noResultsFoundEl = getEl("no-results-found");
   const devModeToggle = getEl("dev-mode-toggle");
+  const loadingOverlay = getEl("loading-overlay");
+
+  // --- SOCKET.IO CONNECTION ---
+  const socket = io("localhost:3000", {
+    transports: ["websocket"],
+  });
+
+  socket.on("connect", () => {
+    console.log("Connected to server via Socket.IO");
+    startUpdateTimer();
+    socket.emit("request-initial-data"); // Request data immediately on connect
+  });
+
+  socket.on("disconnect", () => {
+    console.log("Disconnected from server");
+    if (updateTimerDiv) updateTimerDiv.textContent = "Offline";
+    if (updateTimerInterval) clearInterval(updateTimerInterval);
+  });
+
+  socket.on("mbta-vehicle-update", (data) => {
+    allVehicleData = data;
+    lastUpdateTime = Date.now(); // Reset timer on update
+    if (selectedRouteId) {
+      const routeVehicles = allVehicleData.vehicles.filter(
+        (v) => v.relationships.route.data.id === selectedRouteId
+      );
+      plotVehicles(routeVehicles, allVehicleData.included);
+      updateLineInfoVehicleList(
+        selectedRouteId,
+        routeVehicles,
+        allVehicleData.included
+      );
+    }
+  });
+
+  // Caching maps
+  const routeInfoCache = new Map();
+  const stationToRoutesMap = new Map();
+  const allRouteLayers = new Map();
 
   // --- MAP INITIALIZATION ---
   const map = L.map("map", { preferCanvas: true, zoomControl: false }).setView(
@@ -155,12 +164,9 @@ document.addEventListener("DOMContentLoaded", function () {
   };
 
   // --- DATA & API FUNCTIONS ---
-  // This function fetches initial route/stop info, but not live vehicles
   const fetchAllRouteData = async () => {
-    if (loadingRoutesEl) loadingRoutesEl.classList.remove("hidden");
+    const tempApiKey = "6215b37167cf400d86ebbd2dd4182fdf"; // This can be proxied later too
     try {
-      // Note: This still needs an API key for now. You could proxy this call as well.
-      const tempApiKey = "6215b37167cf400d86ebbd2dd4182fdf";
       const response = await fetch(
         `https://api-v3.mbta.com/routes?filter[type]=0,1,2,4&api_key=${tempApiKey}`
       );
@@ -177,7 +183,7 @@ document.addEventListener("DOMContentLoaded", function () {
     } catch (error) {
       handleFetchError(error);
     } finally {
-      if (loadingRoutesEl) loadingRoutesEl.classList.add("hidden");
+      if (loadingOverlay) loadingOverlay.classList.add("hidden");
     }
   };
 
@@ -341,8 +347,6 @@ document.addEventListener("DOMContentLoaded", function () {
       if (canonicalShapes.length > 0) {
         finalShapes = canonicalShapes;
       }
-    } else if (type === "Ferry") {
-      finalShapes = shapes.filter((s) => !s.id?.startsWith("b0"));
     }
 
     finalShapes.forEach((shape, index) => {
@@ -792,9 +796,18 @@ document.addEventListener("DOMContentLoaded", function () {
       });
     }
 
-    startLiveUpdates(routeId);
+    // Use existing data from socket to populate immediately
+    const routeVehicles = allVehicleData.vehicles.filter(
+      (v) => v.relationships.route.data.id === routeId
+    );
+    plotVehicles(routeVehicles, allVehicleData.included);
     if (shouldShowInfo) {
       showLineInfo(routeId);
+      updateLineInfoVehicleList(
+        routeId,
+        routeVehicles,
+        allVehicleData.included
+      );
     }
   };
 
@@ -828,22 +841,16 @@ document.addEventListener("DOMContentLoaded", function () {
         });
       }
     });
-
-    if (countdownInterval) clearInterval(countdownInterval);
-    if (updateTimerDiv) updateTimerDiv.textContent = "";
   };
 
   // --- LIVE UPDATES ---
-  const startLiveUpdates = (routeId) => {
-    if (countdownInterval) clearInterval(countdownInterval);
-
-    const routeVehicles = allVehicleData.vehicles.filter(
-      (v) => v.relationships.route.data.id === routeId
-    );
-    plotVehicles(routeVehicles, allVehicleData.included);
-    updateLineInfoVehicleList(routeId, routeVehicles, allVehicleData.included);
-
-    if (updateTimerDiv) updateTimerDiv.textContent = "Live";
+  const startUpdateTimer = () => {
+    if (updateTimerInterval) clearInterval(updateTimerInterval);
+    updateTimerInterval = setInterval(() => {
+      const secondsAgo = Math.round((Date.now() - lastUpdateTime) / 1000);
+      if (updateTimerDiv)
+        updateTimerDiv.textContent = `Updated ${secondsAgo}s ago`;
+    }, 1000);
   };
 
   // --- EVENT LISTENERS ---
