@@ -1,0 +1,302 @@
+/* Base Styles & Custom Properties */
+:root {
+  --brand-color: #4f46e5;
+  --cr-color: #80276c;
+  --ferry-color: #008eaa;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f9fafb;
+  --text-primary: #111827;
+  --text-secondary: #6b7280;
+  --border-color: #e5e7eb;
+}
+
+body {
+  font-family: "Inter", sans-serif;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  animation: fadeIn 0.5s ease-in-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+#map {
+  height: 100%;
+  width: 100%;
+  z-index: 10;
+}
+#sidebar {
+  z-index: 20;
+}
+.leaflet-interactive:focus {
+  outline: none;
+}
+
+/* Spinner Animation */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.spinner {
+  border: 3px solid rgba(0, 0, 0, 0.1);
+  border-left-color: var(--brand-color);
+  border-radius: 50%;
+  width: 24px;
+  height: 24px;
+  animation: spin 1s linear infinite;
+}
+
+/* Sidebar Tabs */
+.route-tab {
+  padding: 0.75rem 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  border-bottom: 3px solid transparent;
+  transition: color 0.3s ease, border-color 0.3s ease;
+}
+.route-tab:hover {
+  color: var(--text-primary);
+}
+.route-tab.active {
+  color: var(--active-tab-color, var(--brand-color));
+  border-color: var(--active-tab-color, var(--brand-color));
+}
+
+/* List Item Styling */
+.list-item a {
+  transition: background-color 0.2s ease, color 0.2s ease,
+    padding-left 0.2s ease;
+}
+.list-item a:hover {
+  background-color: var(--bg-secondary);
+  padding-left: 1.25rem; /* 20px */
+}
+.list-item a.active {
+  background-color: var(--active-list-bg-color, #eef2ff);
+  color: var(--active-list-color, #4338ca);
+  font-weight: 600;
+}
+
+/* Toggle Switch */
+.slider-switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 24px;
+}
+.slider-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.slider-thumb {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background-color: #ccc;
+  transition: 0.4s;
+  border-radius: 24px;
+}
+.slider-thumb:before {
+  position: absolute;
+  content: "";
+  height: 16px;
+  width: 16px;
+  left: 4px;
+  bottom: 4px;
+  background-color: white;
+  transition: 0.4s cubic-bezier(0.68, -0.55, 0.27, 1.55);
+  border-radius: 50%;
+}
+input:checked + .slider-thumb {
+  background-color: var(--brand-color);
+}
+input:checked + .slider-thumb:before {
+  transform: translateX(16px);
+}
+
+/* Station & Vehicle Icons */
+.major-station-icon {
+  font-size: 1.75rem;
+  color: white;
+  text-shadow: 0 0 4px black, 0 0 8px black;
+  line-height: 1;
+  text-align: center;
+}
+
+@keyframes pulse-active {
+  0% {
+    transform: scale(1.2) rotate(var(--bearing));
+  }
+  50% {
+    transform: scale(1.6) rotate(var(--bearing));
+  }
+  100% {
+    transform: scale(1.2) rotate(var(--bearing));
+  }
+}
+.vehicle-icon-svg {
+  stroke: white;
+  stroke-width: 1.5px;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+  transform: rotate(var(--bearing));
+  transition: transform 0.5s ease-out;
+}
+.vehicle-icon-svg.active {
+  animation: pulse-active 1.5s infinite ease-in-out;
+}
+
+/* Tooltips */
+.leaflet-tooltip {
+  font-family: "Inter", sans-serif !important;
+}
+.line-label-tooltip,
+.station-label-tooltip {
+  background-color: rgba(0, 0, 0, 0.7) !important;
+  border: none !important;
+  border-radius: 4px;
+  box-shadow: none !important;
+  padding: 2px 6px !important;
+  font-size: 10px !important;
+  font-weight: 700;
+  color: white;
+  cursor: pointer;
+}
+
+/* Info Overlay & Modal Animations */
+.info-overlay {
+  position: absolute;
+  background-color: var(--bg-primary);
+  padding: 1rem;
+  border-radius: 0.75rem; /* 12px */
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1),
+    0 4px 6px -4px rgba(0, 0, 0, 0.1);
+  width: 320px;
+  z-index: 1000;
+  transform-origin: top right;
+  transition: opacity 0.3s ease, transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.info-overlay.hidden {
+  opacity: 0;
+  transform: scale(0.95) translateY(-10px);
+  pointer-events: none;
+}
+.info-overlay.top-right {
+  top: 1rem;
+  right: 1rem;
+}
+
+.close-button {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  color: #9ca3af;
+  font-size: 1.5rem;
+  line-height: 1;
+  font-weight: bold;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+.close-button:hover {
+  color: var(--text-primary);
+}
+.info-header {
+  font-size: 1.125rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  padding-right: 1.5rem;
+  margin-bottom: 0.75rem;
+}
+.info-content {
+  font-size: 0.875rem;
+}
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border-color);
+}
+.info-row:last-child {
+  border-bottom: none;
+}
+.info-label {
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.modal-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: fixed;
+  inset: 0;
+  background-color: rgba(17, 24, 39, 0.75);
+  z-index: 2000;
+  transition: opacity 0.3s ease;
+}
+.modal-container.hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.modal-content {
+  position: relative;
+  padding: 1.5rem;
+  width: 28rem;
+  max-width: 90vw;
+  box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1),
+    0 8px 10px -6px rgba(0, 0, 0, 0.1);
+  border-radius: 0.5rem;
+  background-color: var(--bg-primary);
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease;
+  transform: scale(1);
+  opacity: 1;
+}
+.modal-container.hidden .modal-content {
+  transform: scale(0.95);
+  opacity: 0;
+}
+
+.modal-close-button {
+  padding: 0.6rem 1rem;
+  background-color: var(--brand-color);
+  color: white;
+  font-size: 1rem;
+  font-weight: 500;
+  border-radius: 0.375rem;
+  width: 100%;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  transition: background-color 0.2s, transform 0.1s;
+}
+.modal-close-button:hover {
+  background-color: #4338ca;
+}
+.modal-close-button:active {
+  transform: scale(0.98);
+}
+
+/* Developer Mode Toggle */
+#dev-mode-container {
+  position: absolute;
+  bottom: 10px;
+  left: 10px;
+  z-index: 1000;
+  background-color: rgba(255, 255, 255, 0.8);
+  padding: 8px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  color: #333;
+  backdrop-filter: blur(4px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
