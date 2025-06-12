@@ -5,7 +5,6 @@ document.addEventListener("DOMContentLoaded", function () {
   let allVehicleData = { vehicles: [], included: [] };
   let lastUpdateTime = Date.now();
   let updateTimerInterval;
-  let isInitialVehicleDataLoaded = false;
 
   // --- DOM REFERENCES ---
   const getEl = (id) => document.getElementById(id);
@@ -35,9 +34,8 @@ document.addEventListener("DOMContentLoaded", function () {
   socket.on("connect", () => {
     console.log("Connected to server via Socket.IO");
     startUpdateTimer();
+    // Request initial vehicle data. Route data is now sent automatically by the server.
     socket.emit("request-initial-data");
-    // Request static route data from server
-    socket.emit("request-initial-route-data");
   });
 
   // Listen for the static route data from the server
@@ -52,22 +50,27 @@ document.addEventListener("DOMContentLoaded", function () {
   });
 
   socket.on("mbta-vehicle-update", (data) => {
-    allVehicleData = data;
+    allVehicleData = data; // This can be { vehicles: [], included: [] }
     lastUpdateTime = Date.now();
 
-    if (!isInitialVehicleDataLoaded) {
-      if (loadingOverlay) loadingOverlay.classList.add("hidden");
-      isInitialVehicleDataLoaded = true;
-    }
+    // Determine which vehicles to plot.
+    // If a route is selected, show only those vehicles.
+    // Otherwise, show all vehicles from the update.
+    const vehiclesToPlot = selectedRouteId
+      ? allVehicleData.vehicles.filter(
+          (v) => v.relationships.route.data.id === selectedRouteId
+        )
+      : allVehicleData.vehicles;
 
+    // Always re-plot vehicles on an update. This will clear the layer
+    // and draw the new set, even if that new set is empty.
+    plotVehicles(vehiclesToPlot, allVehicleData.included);
+
+    // Only update the line info panel if it's currently relevant.
     if (selectedRouteId) {
-      const routeVehicles = allVehicleData.vehicles.filter(
-        (v) => v.relationships.route.data.id === selectedRouteId
-      );
-      plotVehicles(routeVehicles, allVehicleData.included);
       updateLineInfoVehicleList(
         selectedRouteId,
-        routeVehicles,
+        vehiclesToPlot,
         allVehicleData.included
       );
     }
@@ -241,8 +244,9 @@ document.addEventListener("DOMContentLoaded", function () {
       drawRoute(route.id, routeInfo, true);
     });
 
-    // Display the initial list
+    // Display the initial list and hide the loading overlay
     displayList("Subway");
+    if (loadingOverlay) loadingOverlay.classList.add("hidden");
   };
 
   // --- UI & PLOTTING ---
