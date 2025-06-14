@@ -27,7 +27,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // Note: This assumes a local server is running on localhost:3000
   // to proxy requests and manage websockets. This will not work in a
   // static environment without that server.
-  const socket = io("localhost:3000", {
+  const socket = io("eddyzow.herokuapp.com", {
     transports: ["websocket"],
   });
 
