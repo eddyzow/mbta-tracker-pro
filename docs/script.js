@@ -27,7 +27,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // Note: This assumes a local server is running on localhost:3000
   // to proxy requests and manage websockets. This will not work in a
   // static environment without that server.
-  const socket = io("eddyzow.herokuapp.com", {
+  const socket = io("localhost:3000", {
     transports: ["websocket"],
   });
 
@@ -55,12 +55,12 @@ document.addEventListener("DOMContentLoaded", function () {
 
     // Determine which vehicles to plot.
     // If a route is selected, show only those vehicles.
-    // Otherwise, show all vehicles from the update.
+    // Otherwise, show an empty array so the map is clear on load.
     const vehiclesToPlot = selectedRouteId
       ? allVehicleData.vehicles.filter(
           (v) => v.relationships.route.data.id === selectedRouteId
         )
-      : allVehicleData.vehicles;
+      : [];
 
     // Always re-plot vehicles on an update. This will clear the layer
     // and draw the new set, even if that new set is empty.
