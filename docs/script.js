@@ -1,1086 +1,1438 @@
 document.addEventListener("DOMContentLoaded", function () {
-  // --- CONFIGURATION & STATE ---
-  let routeDataCache, selectedVehicleId, selectedRouteId, lastClickedShapeId;
+  "use strict";
+
+  /* ============================================================
+     CONFIG & STATE
+     ============================================================ */
+  const MBTA_API = "https://api-v3.mbta.com";
+  const VEHICLE_UPDATE_MS = 30000;
+  const ALERTS_REFRESH_MS = 60000;
+
+  let routeDataCache = null;
+  let selectedVehicleId = null;
+  let selectedRouteId = null;
+  let lastClickedShapeId = null;
   let isDeveloperMode = false;
+  let crrcOnly = false;
+  let showAllLines = true;
   let allVehicleData = { vehicles: [], included: [] };
   let lastUpdateTime = Date.now();
-  let updateTimerInterval;
+  let updateTimerInterval = null;
+  let alertsData = [];
+  let alertsByRoute = new Map();
 
-  // --- DOM REFERENCES ---
+  const interp = new Map();
+  let animationFrame = null;
+  const vehicleDelays = new Map();
+
+  /* ============================================================
+     DOM
+     ============================================================ */
   const getEl = (id) => document.getElementById(id);
-  const querySel = (sel) => document.querySelector(sel);
+  const qs = (s) => document.querySelector(s);
+  const qsa = (s) => document.querySelectorAll(s);
 
-  const updateTimerDiv = getEl("update-timer");
-  const listContainer = getEl("list-container");
-  const vehicleInfoOverlay = getEl("vehicle-info-overlay");
-  const lineInfoOverlay = getEl("line-info-overlay");
-  const stationInfoOverlay = getEl("station-info-overlay");
-  const aboutModal = getEl("about-modal");
-  const searchInput = getEl("search-input");
-  const routeTabs = getEl("route-tabs");
-  const loadingRoutesEl = getEl("loading-routes");
-  const noResultsFoundEl = getEl("no-results-found");
-  const devModeToggle = getEl("dev-mode-toggle");
-  const loadingOverlay = getEl("loading-overlay");
+  const el = {
+    updatePill: getEl("update-pill"),
+    listContainer: getEl("list-container"),
+    alertsList: getEl("alerts-list"),
+    vehicleInfo: getEl("vehicle-info-overlay"),
+    lineInfo: getEl("line-info-overlay"),
+    stationInfo: getEl("station-info-overlay"),
+    alertDetail: getEl("alert-detail-overlay"),
+    settingsModal: getEl("settings-modal"),
+    searchInput: getEl("search-input"),
+    routeTabs: getEl("route-tabs"),
+    mainTabs: getEl("main-tabs"),
+    noResults: getEl("no-results-found"),
+    devToggle: getEl("dev-mode-toggle"),
+    crrcToggle: getEl("crrc-only-toggle"),
+    showAllToggle: getEl("show-all-toggle"),
+    loadingOverlay: getEl("loading-overlay"),
+    connStatus: getEl("connection-status"),
+    alertsBanner: getEl("alerts-banner"),
+    alertsBannerText: getEl("alerts-banner-text"),
+    alertsBannerCount: getEl("alerts-banner-count"),
+    // plan
+    planFrom: getEl("plan-from"),
+    planTo: getEl("plan-to"),
+    planFromSuggest: getEl("plan-from-suggest"),
+    planToSuggest: getEl("plan-to-suggest"),
+    planWhen: getEl("plan-when"),
+    planGo: getEl("plan-go"),
+    planSwap: getEl("plan-swap"),
+    planResult: getEl("plan-result"),
+  };
 
-  // --- SOCKET.IO CONNECTION ---
-  // Note: This assumes a local server is running on localhost:3000
-  // to proxy requests and manage websockets. This will not work in a
-  // static environment without that server.
-  const socket = io("eddyzow.herokuapp.com", {
-    transports: ["websocket"],
-  });
-
-  socket.on("connect", () => {
-    console.log("Connected to server via Socket.IO");
-    startUpdateTimer();
-    // Request initial vehicle data. Route data is now sent automatically by the server.
-    socket.emit("request-initial-data");
-  });
-
-  // Listen for the static route data from the server
-  socket.on("mbta-route-data", (data) => {
-    processRouteData(data);
-  });
-
-  socket.on("disconnect", () => {
-    console.log("Disconnected from server");
-    if (updateTimerDiv) updateTimerDiv.textContent = "Offline";
-    if (updateTimerInterval) clearInterval(updateTimerInterval);
-  });
-
-  socket.on("mbta-vehicle-update", (data) => {
-    allVehicleData = data; // This can be { vehicles: [], included: [] }
-    lastUpdateTime = Date.now();
-
-    // Determine which vehicles to plot.
-    // If a route is selected, show only those vehicles.
-    // Otherwise, show an empty array so the map is clear on load.
-    const vehiclesToPlot = selectedRouteId
-      ? allVehicleData.vehicles.filter(
-          (v) => v.relationships.route.data.id === selectedRouteId
-        )
-      : [];
-
-    // Always re-plot vehicles on an update. This will clear the layer
-    // and draw the new set, even if that new set is empty.
-    plotVehicles(vehiclesToPlot, allVehicleData.included);
-
-    // Only update the line info panel if it's currently relevant.
-    if (selectedRouteId) {
-      updateLineInfoVehicleList(
-        selectedRouteId,
-        vehiclesToPlot,
-        allVehicleData.included
-      );
-    }
-  });
-
-  // Caching maps
-  const routeInfoCache = new Map();
-  const stationToRoutesMap = new Map();
+  // Caches
+  const routeInfoCache = new Map();      // routeId -> { stops, shapes }
+  const stationToRoutesMap = new Map();  // name -> { routes:Set, id, location }
+  const stopIdToName = new Map();         // stopId (child or parent) -> station name
   const allRouteLayers = new Map();
+  const routePolylinePts = new Map();
+  const journeyLayer = L.layerGroup();
 
-  // --- MAP INITIALIZATION ---
-  const map = L.map("map", { preferCanvas: true, zoomControl: false }).setView(
-    [42.3601, -71.0589],
-    12
-  );
+  /* ============================================================
+     MAP INIT
+     ============================================================ */
+  const map = L.map("map", {
+    preferCanvas: true,
+    zoomControl: false,
+    minZoom: 9,
+    maxZoom: 18,
+    // Smooth but BOUNDED wheel zoom. zoomSnap:0 continuous was letting a single
+    // trackpad flick run to the min zoom; a small snap + gentle wheel step keeps
+    // it controlled on both trackpad and mouse.
+    scrollWheelZoom: true,
+    zoomSnap: 0.5,
+    zoomDelta: 0.5,
+    wheelDebounceTime: 40,
+    wheelPxPerZoomLevel: 220, // larger = each wheel notch zooms less (calmer)
+    zoomAnimation: true,
+  }).setView([42.3601, -71.0589], 12);
+
   L.control.zoom({ position: "bottomright" }).addTo(map);
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", {
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png", {
     attribution:
-      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a> · MBTA v3 API',
     maxZoom: 20,
+    subdomains: "abcd",
+  }).addTo(map);
+  // Labels on a separate pane above routes so street/place names stay readable.
+  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png", {
+    maxZoom: 20, subdomains: "abcd", pane: "shadowPane", opacity: 0.9,
   }).addTo(map);
 
   const vehicleLayer = L.layerGroup().addTo(map);
+  const vehicleCtxLayer = L.layerGroup().addTo(map); // prev/next stop highlight
+  journeyLayer.addTo(map);
 
-  // --- UTILITY & HELPER FUNCTIONS ---
-  const handleApiError = async (response) => {
-    if (!response.ok) {
-      const error = new Error(`API Error: ${response.statusText}`);
-      try {
-        error.data = await response.json();
-      } catch (e) {}
-      throw error;
-    }
-    return response.json();
+  /* ============================================================
+     UTILITIES
+     ============================================================ */
+  const formatRelativeTime = (iso) => {
+    if (!iso) return "N/A";
+    const s = Math.round((Date.now() - new Date(iso).getTime()) / 1000);
+    if (s < 5) return "just now";
+    if (s < 60) return `${s}s ago`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
   };
 
-  const handleFetchError = (error) => {
-    console.error("Fetch Error:", error);
-    if (loadingRoutesEl) loadingRoutesEl.classList.add("hidden");
-    listContainer.innerHTML = `<p class="text-center text-red-500 p-4">Failed to load data. Please check your connection and API key.</p>`;
+  const formatArrivalTime = (t) => {
+    if (!t) return null;
+    const d = Math.round((new Date(t) - new Date()) / 60000);
+    if (d < 0) return null;
+    if (d < 1) return "Arriving";
+    if (d === 1) return "1 min";
+    return `${d} min`;
   };
 
-  /**
-   * Defines the missing formatRelativeTime function.
-   * Converts an ISO date string to a human-readable relative time.
-   * @param {string} isoString - The ISO 8601 date string to convert.
-   * @returns {string} A string like "just now", "5m ago", etc.
-   */
-  const formatRelativeTime = (isoString) => {
-    if (!isoString) return "N/A";
-    const now = new Date();
-    const past = new Date(isoString);
-    const secondsPast = Math.round((now.getTime() - past.getTime()) / 1000);
+  const clockTime = (iso) =>
+    !iso ? "—" : new Date(iso).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 
-    if (secondsPast < 5) {
-      return "just now";
-    }
-    if (secondsPast < 60) {
-      return `${secondsPast}s ago`;
-    }
-    const minutesPast = Math.floor(secondsPast / 60);
-    if (minutesPast < 60) {
-      return `${minutesPast}m ago`;
-    }
-    const hoursPast = Math.floor(minutesPast / 60);
-    if (hoursPast < 24) {
-      return `${hoursPast}h ago`;
-    }
-    const daysPast = Math.floor(hoursPast / 24);
-    return `${daysPast}d ago`;
+  const fmtDuration = (mins) => {
+    mins = Math.round(mins);
+    if (mins < 60) return `${mins} min`;
+    const h = Math.floor(mins / 60), m = mins % 60;
+    return m ? `${h} hr ${m} min` : `${h} hr`;
   };
 
-  const formatArrivalTime = (time) => {
-    if (!time) return "N/A";
-    const date = new Date(time);
-    const now = new Date();
-    const diffMinutes = Math.round((date - now) / 60000);
-
-    if (diffMinutes < 1) return "Arriving";
-    if (diffMinutes === 1) return "1 min";
-    return `${diffMinutes} min`;
+  const MBTA_COLORS = {
+    Red: "#DA291C", Mattapan: "#DA291C", Orange: "#ED8B00", Blue: "#003DA5",
+    "Green-": "#00843D", "CR-": "#80276C", "Boat-": "#008EAA", Ferry: "#008EAA",
   };
-
   const getRouteStyle = (routeId) => {
-    const styles = {
-      Red: "#DA291C",
-      Mattapan: "#DA291C",
-      Orange: "#ED8B00",
-      Blue: "#003DA5",
-      "Green-": "#00843D",
-      "CR-": "#80276C",
-      "Boat-": "#008EAA",
-      Ferry: "#008EAA",
-    };
     if (!routeId) return { color: "#80276C", type: "Other" };
-    const key = Object.keys(styles).find((k) => routeId.startsWith(k)) || "CR-";
-    return { color: styles[key], type: getRouteType(routeId) };
+    const key = Object.keys(MBTA_COLORS).find((k) => routeId.startsWith(k)) || "CR-";
+    return { color: MBTA_COLORS[key], type: getRouteType(routeId) };
+  };
+  const getRouteType = (idOrType) => {
+    if (typeof idOrType !== "string" && typeof idOrType !== "number") return "Other";
+    const route = routeDataCache?.find((r) => r.id === idOrType);
+    const tn = typeof idOrType === "number" ? idOrType : route?.attributes.type;
+    if (tn === 0 || tn === 1) return "Subway";
+    if (tn === 2) return "Commuter Rail";
+    if (tn === 4) return "Ferry";
+    return "Other";
+  };
+  const routeLongName = (id) =>
+    routeDataCache?.find((r) => r.id === id)?.attributes.long_name || id;
+  const routeShortLabel = (id) => {
+    if (id.startsWith("CR-")) return id.replace("CR-", "");
+    if (id.startsWith("Green-")) return id.replace("Green-", "GL ");
+    if (id.startsWith("Boat-")) return "Ferry";
+    return id;
   };
 
-  const getRouteType = (routeIdOrType) => {
-    if (typeof routeIdOrType !== "string" && typeof routeIdOrType !== "number")
-      return "Other";
-    const route = routeDataCache?.find((r) => r.id === routeIdOrType);
-    const typeNumber =
-      typeof routeIdOrType === "number"
-        ? routeIdOrType
-        : route?.attributes.type;
-    if (typeNumber === 0 || typeNumber === 1) return "Subway";
-    if (typeNumber === 2) return "Commuter Rail";
-    if (typeNumber === 4) return "Ferry";
-    return "Other";
+  // CRRC detection (Orange 1400–1551, Red 1900–2151)
+  const isCrrcVehicle = (v) => {
+    const routeId = v?.relationships?.route?.data?.id;
+    const cars = v?.attributes?.carriages || [];
+    let labels = cars.map((c) => parseInt(c.label, 10)).filter((n) => !isNaN(n));
+    if (!labels.length) {
+      const n = parseInt(v?.attributes?.label, 10);
+      if (!isNaN(n)) labels = [n];
+    }
+    if (routeId === "Orange") return labels.some((n) => n >= 1400 && n <= 1551);
+    if (routeId === "Red") return labels.some((n) => n >= 1900 && n <= 2151);
+    return false;
   };
 
   const decodePolyline = (t) => {
-    let points = [],
-      index = 0,
-      len = t.length,
-      lat = 0,
-      lng = 0;
-    while (index < len) {
-      let b,
-        shift = 0,
-        result = 0;
-      do {
-        b = t.charCodeAt(index++) - 63;
-        result |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      let dlat = result & 1 ? ~(result >> 1) : result >> 1;
-      lat += dlat;
-      shift = 0;
-      result = 0;
-      do {
-        b = t.charCodeAt(index++) - 63;
-        result |= (b & 0x1f) << shift;
-        shift += 5;
-      } while (b >= 0x20);
-      let dlng = result & 1 ? ~(result >> 1) : result >> 1;
-      lng += dlng;
-      points.push([lat / 1e5, lng / 1e5]);
+    let pts = [], i = 0, len = t.length, lat = 0, lng = 0;
+    while (i < len) {
+      let b, sh = 0, res = 0;
+      do { b = t.charCodeAt(i++) - 63; res |= (b & 0x1f) << sh; sh += 5; } while (b >= 0x20);
+      lat += res & 1 ? ~(res >> 1) : res >> 1; sh = 0; res = 0;
+      do { b = t.charCodeAt(i++) - 63; res |= (b & 0x1f) << sh; sh += 5; } while (b >= 0x20);
+      lng += res & 1 ? ~(res >> 1) : res >> 1;
+      pts.push([lat / 1e5, lng / 1e5]);
     }
-    return points;
+    return pts;
   };
 
-  // --- DATA & API FUNCTIONS ---
+  const haversine = (a, b) => {
+    const R = 6371, toR = (d) => (d * Math.PI) / 180;
+    const dLat = toR(b[0] - a[0]), dLng = toR(b[1] - a[1]);
+    const s = Math.sin(dLat / 2) ** 2 + Math.cos(toR(a[0])) * Math.cos(toR(b[0])) * Math.sin(dLng / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(s)); // km
+  };
+
+  // ---- Route polyline distance model (for route-following interpolation) ----
+  // For each route we precompute the cumulative distance (km) at each vertex so
+  // we can map a lat/lng to a distance-along-route and back. This lets a train
+  // advance ALONG the tracks by (speed × elapsed), instead of a straight lerp
+  // that cuts across corners.
+  const routeCumDist = new Map(); // routeId -> { pts:[[lat,lng]], cum:[km] }
+
+  const buildRouteDistances = (routeId, pts) => {
+    if (!pts || pts.length < 2) return;
+    const cum = [0];
+    for (let i = 1; i < pts.length; i++) cum[i] = cum[i - 1] + haversine(pts[i - 1], pts[i]);
+    routeCumDist.set(routeId, { pts, cum });
+  };
+
+  // Nearest distance-along-route (km) to a given latlng.
+  const distanceAlongRoute = (routeId, latlng) => {
+    const rd = routeCumDist.get(routeId);
+    if (!rd) return null;
+    const { pts, cum } = rd;
+    const p = [latlng.lat ?? latlng[0], latlng.lng ?? latlng[1]];
+    let best = 0, bestDist = Infinity;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const proj = projectOnSegment(p, pts[i], pts[i + 1]);
+      const d = haversine(p, proj.point);
+      if (d < bestDist) { bestDist = d; best = cum[i] + haversine(pts[i], proj.point); }
+    }
+    return best;
+  };
+
+  // Position (lat,lng) at a given distance-along-route (km).
+  const positionAtDistance = (routeId, dist) => {
+    const rd = routeCumDist.get(routeId);
+    if (!rd) return null;
+    const { pts, cum } = rd;
+    if (dist <= 0) return pts[0];
+    const total = cum[cum.length - 1];
+    if (dist >= total) return pts[pts.length - 1];
+    // binary search the segment containing `dist`
+    let lo = 0, hi = cum.length - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] < dist) lo = mid + 1; else hi = mid; }
+    const i = Math.max(1, lo);
+    const segLen = cum[i] - cum[i - 1] || 1e-9;
+    const t = (dist - cum[i - 1]) / segLen;
+    return [pts[i - 1][0] + (pts[i][0] - pts[i - 1][0]) * t, pts[i - 1][1] + (pts[i][1] - pts[i - 1][1]) * t];
+  };
+
+  // Project point p onto segment a-b (planar approx, fine at metro scale).
+  const projectOnSegment = (p, a, b) => {
+    const ax = a[1], ay = a[0], bx = b[1], by = b[0], px = p[1], py = p[0];
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy || 1e-12;
+    let t = ((px - ax) * dx + (py - ay) * dy) / len2;
+    t = Math.max(0, Math.min(1, t));
+    return { point: [ay + dy * t, ax + dx * t], t };
+  };
+
+  // Bearing (deg from north, clockwise) of the route at a given distance —
+  // used to point the train arrow along the track.
+  const bearingAtDistance = (routeId, dist) => {
+    const a = positionAtDistance(routeId, Math.max(0, dist - 0.03));
+    const b = positionAtDistance(routeId, dist + 0.03);
+    if (!a || !b) return null;
+    const toR = (d) => (d * Math.PI) / 180, toD = (r) => (r * 180) / Math.PI;
+    const y = Math.sin(toR(b[1] - a[1])) * Math.cos(toR(b[0]));
+    const x = Math.cos(toR(a[0])) * Math.sin(toR(b[0])) - Math.sin(toR(a[0])) * Math.cos(toR(b[0])) * Math.cos(toR(b[1] - a[1]));
+    return (toD(Math.atan2(y, x)) + 360) % 360;
+  };
+
+  /* ============================================================
+     DIRECT MBTA API CLIENT
+     ============================================================ */
+  const mbtaApi = {
+    async get(path, params = {}) {
+      const url = new URL(MBTA_API + path);
+      Object.entries(params).forEach(([k, v]) => {
+        if (v !== undefined && v !== null) url.searchParams.set(k, v);
+      });
+      const res = await fetch(url.toString(), { headers: { Accept: "application/json" } });
+      if (!res.ok) throw new Error(`MBTA API ${res.status} on ${path}`);
+      return res.json();
+    },
+    alerts() { return this.get("/alerts", { "filter[datetime]": "NOW" }); },
+    vehiclesForRoute(routeId) {
+      return this.get("/vehicles", { "filter[route]": routeId, include: "trip,stop", "page[limit]": 120 });
+    },
+    predictionsForStop(stopId) {
+      return this.get("/predictions", { "filter[stop]": stopId, include: "trip,route", "page[limit]": 60, sort: "arrival_time" });
+    },
+    tripPredictions(tripId) {
+      return this.get("/predictions", { "filter[trip]": tripId, include: "stop,schedule", sort: "stop_sequence" });
+    },
+    scheduleForRouteStops(routeId, stopIds) {
+      return this.get("/schedules", {
+        "filter[route]": routeId, "filter[stop]": stopIds.join(","),
+        include: "trip,stop", sort: "departure_time", "page[limit]": 600,
+      });
+    },
+  };
+  const parentStationId = (stopObj, fb) =>
+    stopObj?.relationships?.parent_station?.data?.id || fb;
+
+  /* ============================================================
+     SOCKET.IO
+     ============================================================ */
+  const SOCKET_URL = "https://eddyzow.herokuapp.com";
+  const MOCK_MODE = new URLSearchParams(location.search).has("mock");
+
+  const setConn = (state, label) => {
+    el.connStatus.className = "conn-status " + state;
+    el.connStatus.querySelector(".conn-label").textContent = label;
+  };
+  const socket = MOCK_MODE
+    ? { on() {}, once() {}, emit() {} }
+    : io(SOCKET_URL, { transports: ["websocket", "polling"] });
+
+  socket.on("connect", () => { setConn("online", "live"); startUpdateTimer(); socket.emit("request-initial-data"); });
+  socket.on("disconnect", () => { setConn("offline", "offline"); if (updateTimerInterval) clearInterval(updateTimerInterval); el.updatePill.textContent = "Offline"; });
+  socket.on("connect_error", () => setConn("offline", "connection error"));
+  socket.on("mbta-route-data", (d) => processRouteData(d));
+  socket.on("mbta-vehicle-update", (d) => handleVehicleUpdate(d));
+
+  const handleVehicleUpdate = (data) => {
+    allVehicleData = data;
+    lastUpdateTime = Date.now();
+    const plot = getVehiclesForSelection();
+    plotVehicles(plot, allVehicleData.included);
+    if (selectedRouteId) updateLineInfoVehicleList(selectedRouteId, plot, allVehicleData.included);
+    if (selectedVehicleId && !el.vehicleInfo.classList.contains("hidden")) {
+      const v = allVehicleData.vehicles.find((x) => x.id === selectedVehicleId);
+      if (v) refreshVehiclePanelData(v);
+    }
+  };
+
+  // Mock replay
+  if (MOCK_MODE) {
+    fetch("__mock.json").then((r) => r.json()).then((m) => {
+      setConn("online", "mock");
+      startUpdateTimer();
+      processRouteData(m.routeData);
+      const pump = () => handleVehicleUpdate(m.vehicles);
+      pump();
+      setInterval(pump, VEHICLE_UPDATE_MS);
+    }).catch((e) => console.warn("mock load failed", e));
+  }
+
+  /* ============================================================
+     ROUTE DATA + NETWORK GRAPH
+     ============================================================ */
+  // Graph: station name -> { name, location, routes:Set, neighbors: Map(routeId -> [orderedStationNames]) }
+  const graph = new Map();
+  // routeId -> ordered array of station names (deduped along the route)
+  const routeStationOrder = new Map();
+
   const processRouteData = (data) => {
     routeDataCache = data;
     data.forEach((route) => {
-      // Populate routeInfoCache
-      const routeInfo = {
-        stops: route.stops || [],
-        shapes: route.shapes || [],
-      };
+      const routeInfo = { stops: route.stops || [], shapes: route.shapes || [] };
       routeInfoCache.set(route.id, routeInfo);
 
-      // Populate stationToRoutesMap
+      const orderedNames = [];
       if (route.stops) {
         route.stops.forEach((stop) => {
           const { name, latitude, longitude } = stop.attributes;
+          stopIdToName.set(stop.id, name);
+          const parent = stop.relationships?.parent_station?.data?.id;
+          if (parent) stopIdToName.set(parent, name);
           const existing = stationToRoutesMap.get(name) || {
-            routes: new Set(),
-            id: stop.id,
-            location: L.latLng(latitude, longitude),
+            routes: new Set(), id: parent || stop.id, location: L.latLng(latitude, longitude),
           };
           existing.routes.add(route.id);
+          if (parent) existing.id = parent;
           stationToRoutesMap.set(name, existing);
+          if (orderedNames[orderedNames.length - 1] !== name) orderedNames.push(name);
+
+          // graph node
+          if (!graph.has(name)) graph.set(name, { name, location: [latitude, longitude], routes: new Set(), neighbors: new Map() });
+          graph.get(name).routes.add(route.id);
         });
       }
-
-      // Draw the route on the map
+      routeStationOrder.set(route.id, orderedNames);
       drawRoute(route.id, routeInfo, true);
     });
 
-    // Display the initial list and hide the loading overlay
+    buildGraphEdges();
     displayList("Subway");
-    if (loadingOverlay) loadingOverlay.classList.add("hidden");
+    populatePlanner();
+    loadAlerts();
+    setInterval(loadAlerts, ALERTS_REFRESH_MS);
+    if (el.loadingOverlay) el.loadingOverlay.classList.add("hidden");
+    requestAnimationFrame(() => map.invalidateSize());
+    setTimeout(() => map.invalidateSize(), 300);
   };
 
-  // --- UI & PLOTTING ---
+  // Connect adjacent stations along each route (ride edges).
+  const buildGraphEdges = () => {
+    routeStationOrder.forEach((names, routeId) => {
+      for (let i = 0; i < names.length; i++) {
+        const node = graph.get(names[i]);
+        if (!node) continue;
+        if (!node.neighbors.has(routeId)) node.neighbors.set(routeId, new Set());
+        if (i > 0) node.neighbors.get(routeId).add(names[i - 1]);
+        if (i < names.length - 1) node.neighbors.get(routeId).add(names[i + 1]);
+      }
+    });
+  };
+
+  /* ============================================================
+     LIST RENDERING (Lines tab)
+     ============================================================ */
   const displayList = (activeType, searchTerm = "") => {
     if (!routeDataCache) return;
-    listContainer.innerHTML = "";
-    if (noResultsFoundEl) noResultsFoundEl.classList.add("hidden");
+    el.listContainer.innerHTML = "";
+    el.noResults.classList.add("hidden");
 
-    const systemVisibleToggle = querySel(
-      `.system-toggle[data-system="${activeType}"]`
-    );
-    if (!systemVisibleToggle || !systemVisibleToggle.checked) {
-      listContainer.innerHTML = `<p class="text-center text-gray-500 p-4">Enable the "${activeType}" system view.</p>`;
+    const sysToggle = qs(`.system-toggle[data-system="${activeType}"]`);
+    if (sysToggle && !sysToggle.checked) {
+      el.listContainer.innerHTML = `<p class="empty-note">Enable “${activeType}” in Settings to see its routes.</p>`;
       return;
     }
-
-    const lowerSearchTerm = searchTerm.toLowerCase();
-    let results = [];
-
+    const lower = searchTerm.toLowerCase();
+    const results = [];
     routeDataCache.forEach((r) => {
       const name = isDeveloperMode ? r.id : r.attributes.long_name;
-      const searchName = isDeveloperMode
-        ? r.id.toLowerCase()
-        : r.attributes.long_name.toLowerCase();
-      if (
-        getRouteType(r.id) === activeType &&
-        searchName.includes(lowerSearchTerm)
-      ) {
-        results.push({ type: "route", id: r.id, name: name });
-      }
+      if (getRouteType(r.id) === activeType && (isDeveloperMode ? r.id : r.attributes.long_name).toLowerCase().includes(lower))
+        results.push({ type: "route", id: r.id, name });
     });
-
     if (searchTerm.length > 1) {
-      stationToRoutesMap.forEach((data, name) => {
-        const searchName = isDeveloperMode
-          ? data.id.toLowerCase()
-          : name.toLowerCase();
-        const displayName = isDeveloperMode ? data.id : name;
-        if (
-          searchName.includes(lowerSearchTerm) &&
-          Array.from(data.routes).some(
-            (rId) => getRouteType(rId) === activeType
-          )
-        ) {
-          results.push({
-            type: "station",
-            id: data.id,
-            name: displayName,
-            originalName: name,
-            location: data.location,
-          });
-        }
+      stationToRoutesMap.forEach((d, name) => {
+        if ((isDeveloperMode ? d.id : name).toLowerCase().includes(lower) &&
+          [...d.routes].some((rId) => getRouteType(rId) === activeType))
+          results.push({ type: "station", id: d.id, name: isDeveloperMode ? d.id : name, originalName: name, location: d.location });
       });
     }
-
-    if (results.length === 0) {
-      if (noResultsFoundEl) noResultsFoundEl.classList.remove("hidden");
-      return;
-    }
+    if (!results.length) { el.noResults.classList.remove("hidden"); el.listContainer.appendChild(el.noResults); return; }
 
     const list = document.createElement("ul");
-    list.className = "space-y-1";
     results.forEach((item) => {
-      const itemRoutes = stationToRoutesMap.get(
-        item.originalName || item.name
-      )?.routes;
-      const firstRouteId =
-        item.type === "route"
-          ? item.id
-          : itemRoutes
-          ? Array.from(itemRoutes)[0]
-          : "";
+      const itemRoutes = stationToRoutesMap.get(item.originalName || item.name)?.routes;
+      const firstRouteId = item.type === "route" ? item.id : itemRoutes ? [...itemRoutes][0] : "";
       const { color } = getRouteStyle(firstRouteId);
-
       const li = document.createElement("li");
       li.className = "list-item";
-      const a = document.createElement("a");
-      a.href = "#";
-      a.className = "block w-full text-left p-2 rounded-md transition-all";
-      a.dataset.id = item.id;
-      a.dataset.type = item.type;
-      a.dataset.name = item.originalName || item.name;
-      a.textContent = item.name;
-
-      if (item.type === "route" && item.id === selectedRouteId) {
-        a.classList.add("active");
-        a.style.backgroundColor = `${color}20`;
-        a.style.color = color;
+      const row = document.createElement("a");
+      row.href = "#"; row.className = "list-row";
+      row.dataset.id = item.id; row.dataset.type = item.type; row.dataset.name = item.originalName || item.name;
+      let badge = "";
+      if (item.type === "route") {
+        const a = alertsByRoute.get(item.id);
+        if (a && a.length) {
+          const worst = a.some((x) => ["SHUTTLE", "SUSPENSION", "STATION_CLOSURE"].includes(x.attributes.effect));
+          badge = `<span class="mini-badge ${worst ? "shuttle" : "alert"}">${worst ? "Shuttle" : "Alert"}</span>`;
+        }
       }
-      li.appendChild(a);
-      list.appendChild(li);
+      row.innerHTML = `<span class="list-swatch" style="background:${color}"></span>
+        <span>${item.name}${item.type === "station" ? '<div class="sub">Station</div>' : ""}</span>
+        <span class="list-meta">${badge}</span>`;
+      if (item.type === "route" && item.id === selectedRouteId) { row.classList.add("active"); }
+      li.appendChild(row); list.appendChild(li);
     });
-    listContainer.appendChild(list);
+    el.listContainer.appendChild(list);
   };
+
+  /* ============================================================
+     ROUTE DRAWING + STATION MARKERS
+     ============================================================ */
+  const majorStations = new Set(["North Station", "South Station", "Back Bay", "Park Street", "Downtown Crossing", "Government Center", "Airport", "Ruggles", "JFK/UMass"]);
 
   const drawRoute = (routeId, { stops, shapes }, isInactive) => {
-    const layerGroup = allRouteLayers.get(routeId) || {
-      shapes: L.featureGroup(),
-      stops: L.featureGroup(),
-    };
-    Object.values(layerGroup).forEach((lg) => lg.clearLayers().addTo(map));
+    const layerGroup = allRouteLayers.get(routeId) || { shapes: L.featureGroup(), stops: L.featureGroup() };
+    Object.values(layerGroup).forEach((lg) => lg.clearLayers());
     allRouteLayers.set(routeId, layerGroup);
-
+    // Respect show-all + system visibility on (re)draw
     const { color, type } = getRouteStyle(routeId);
-    const style = {
-      color,
-      weight: isInactive ? 3 : 7,
-      opacity: isInactive ? 0.35 : 0.9,
-      lineCap: "round",
-      lineJoin: "round",
-    };
-
-    if (!stops || !shapes || shapes.length === 0) return;
-
-    let finalShapes = shapes;
-    if (type === "Subway" || type === "Commuter Rail") {
-      const canonicalShapes = shapes.filter((s) =>
-        s.id?.startsWith("canonical")
-      );
-      if (canonicalShapes.length > 0) {
-        finalShapes = canonicalShapes;
-      }
+    const sysVisible = qs(`.system-toggle[data-system="${type}"]`)?.checked ?? true;
+    if (sysVisible && (showAllLines || !isInactive || routeId === selectedRouteId)) {
+      Object.values(layerGroup).forEach((lg) => lg.addTo(map));
     }
 
-    finalShapes.forEach((shape, index) => {
-      if (!shape || !shape.attributes.polyline) return;
-      const polyline = L.polyline(decodePolyline(shape.attributes.polyline), {
-        ...style,
-        offset: (index - (finalShapes.length - 1) / 2) * (isInactive ? 2 : 4),
-      });
+    const style = { color, weight: isInactive ? 3 : 6, opacity: isInactive ? 0.4 : 0.95, lineCap: "round", lineJoin: "round" };
+    if (!stops || !shapes || !shapes.length) return;
 
-      const routeName =
-        routeDataCache.find((r) => r.id === routeId)?.attributes.long_name ||
-        routeId;
-      let tooltipContent = isDeveloperMode
-        ? `Route: ${routeId}<br>Shape: ${shape.id}`
-        : routeName;
-      polyline.bindTooltip(tooltipContent, {
-        className: "line-label-tooltip",
-        sticky: true,
-      });
+    // Pick the real GEOGRAPHIC rail shapes and drop the "straight line between
+    // stations" generated shapes. Prefer canonical; among those, keep only
+    // shapes with high point-density (the generated connectors are sparse).
+    const decoded = shapes
+      .filter((s) => s && s.attributes.polyline)
+      .map((s) => {
+        const pts = decodePolyline(s.attributes.polyline);
+        let km = 0;
+        for (let i = 1; i < pts.length; i++) km += haversine(pts[i - 1], pts[i]);
+        return { id: s.id, pts, km, density: pts.length / (km || 1e-6), canonical: !!s.id?.startsWith("canonical") };
+      })
+      .filter((s) => s.pts.length >= 2);
 
-      polyline.on("click", (e) => {
-        L.DomEvent.stop(e);
-        lastClickedShapeId = shape.id;
-        selectRoute(routeId);
-      });
-      layerGroup.shapes.addLayer(polyline);
+    let finalShapes = decoded.filter((s) => s.canonical);
+    if (!finalShapes.length) finalShapes = decoded;
+    // Geographic rail has many points per km; station-connector lines are sparse.
+    // Keep shapes at/above 60% of the densest shape's density (min 8 pts/km).
+    const maxDensity = Math.max(...finalShapes.map((s) => s.density), 0);
+    if (maxDensity > 0) {
+      const threshold = Math.max(8, maxDensity * 0.6);
+      const dense = finalShapes.filter((s) => s.density >= threshold);
+      if (dense.length) finalShapes = dense;
+    }
+
+    let longest = null, longestLen = -1;
+    finalShapes.forEach((shape) => {
+      const pts = shape.pts;
+      if (pts.length > longestLen) { longestLen = pts.length; longest = pts; }
+      const hit = L.polyline(pts, { color, weight: 16, opacity: 0, lineCap: "round" });
+      hit.on("click", (e) => { L.DomEvent.stop(e); lastClickedShapeId = shape.id; selectRoute(routeId); });
+      hit.bindTooltip(isDeveloperMode ? `${routeId} / ${shape.id}` : routeLongName(routeId), { className: "line-label-tooltip", sticky: true });
+      hit._isHit = true;
+      layerGroup.shapes.addLayer(hit);
+      const pl = L.polyline(pts, { ...style, interactive: false });
+      pl._isVisibleLine = true;
+      layerGroup.shapes.addLayer(pl);
     });
+    if (longest) { routePolylinePts.set(routeId, longest); buildRouteDistances(routeId, longest); }
 
-    const drawnStations = new Set();
+    const drawn = new Set();
     stops.forEach((stop) => {
       const { name, latitude, longitude } = stop.attributes;
-      if (drawnStations.has(name) || !latitude || !longitude) return;
+      if (drawn.has(name) || !latitude || !longitude) return;
+      const servicing = stationToRoutesMap.get(name);
+      const isTransfer = servicing && servicing.routes.size > 1;
+      const isMajor = majorStations.has(name);
 
-      const isMajorStation =
-        name.includes("North Station") || name.includes("South Station");
-      const servicingRoutesData = stationToRoutesMap.get(name);
-      const isTransfer =
-        servicingRoutesData && servicingRoutesData.routes.size > 1;
-      const displayName = isDeveloperMode ? stop.id : name;
-
-      let marker;
-      if (isMajorStation) {
-        marker = L.marker([latitude, longitude], {
-          icon: L.divIcon({
-            className: "major-station-icon",
-            html: "✪",
-            iconSize: [24, 24],
-          }),
-        });
-      } else {
-        marker = L.circleMarker([latitude, longitude], {
-          radius: isInactive ? 4 : isTransfer ? 7 : 5,
-          fillColor: isInactive ? "#fff" : isTransfer ? "#fff" : color,
-          color: color,
-          weight: isTransfer ? 3 : 2,
-          opacity: style.opacity,
-          fillOpacity: style.opacity,
-        });
-      }
-
-      marker.on("click", (e) => {
-        L.DomEvent.stop(e);
-        showStationInfo(name);
+      const marker = L.circleMarker([latitude, longitude], {
+        radius: isInactive ? (isTransfer ? 4 : 3) : isTransfer ? 6.5 : 5,
+        fillColor: isTransfer ? "#ffffff" : color,
+        color: isTransfer ? color : "#000",
+        weight: isTransfer ? 2.5 : 1.5,
+        opacity: style.opacity, fillOpacity: isTransfer ? 1 : style.opacity,
       });
-
-      marker
-        .bindTooltip(displayName, {
-          className: "station-label-tooltip",
-          direction: "top",
-          offset: [0, -5],
-        })
-        .addTo(layerGroup.stops);
-      drawnStations.add(name);
+      marker.on("click", (e) => { L.DomEvent.stop(e); showStationInfo(name); });
+      if (isMajor) {
+        marker.bindTooltip(isDeveloperMode ? stop.id : name, { permanent: true, direction: "top", offset: [0, -6], className: "station-name-tooltip" });
+      } else {
+        marker.bindTooltip(isDeveloperMode ? stop.id : name, { direction: "top", offset: [0, -5], className: "station-label-tooltip" });
+      }
+      marker.addTo(layerGroup.stops);
+      drawn.add(name);
     });
-
-    layerGroup.stops.bringToFront();
+    if (routeId === selectedRouteId) layerGroup.stops.bringToFront();
   };
 
-  const plotVehicles = (vehicles, includedData) => {
-    vehicleLayer.clearLayers();
-    if (!vehicles) return;
-    const lookup = new Map(
-      includedData?.map((item) => [item.id, item.attributes])
-    );
-
-    vehicles.forEach((vehicle) => {
-      const { latitude, longitude, label, bearing } = vehicle.attributes;
-      const routeId = vehicle.relationships.route.data.id;
-      const { color, type } = getRouteStyle(routeId);
-      const isActive = vehicle.id === selectedVehicleId;
-      const vehicleSVG = `<svg class="vehicle-icon-svg ${
-        isActive ? "active" : ""
-      }" style="--bearing: ${
-        bearing || 0
-      }deg" width="24" height="24" viewBox="0 0 32 32"><path fill="${color}" d="M16 2 L2 25 L16 19 L30 25 z"/></svg>`;
-      const vehicleIcon = L.divIcon({
-        className: "",
-        html: vehicleSVG,
-        iconSize: [24, 24],
-      });
-      const marker = L.marker([latitude, longitude], {
-        icon: vehicleIcon,
-        zIndexOffset: 1000,
-        vehicleData: vehicle,
-        includedData: lookup,
-      });
-
-      const tooltipText = isDeveloperMode
-        ? vehicle.id
-        : `Train ${label || vehicle.id}`;
-      const tooltipOptions = {
-        className: "station-label-tooltip",
-        permanent: type === "Commuter Rail",
-        direction: "right",
-        offset: [12, 0],
-      };
-      if (type === "Commuter Rail")
-        tooltipOptions.className += " cr-vehicle-tooltip";
-
-      marker.bindTooltip(tooltipText, tooltipOptions);
-
-      marker.on("click", (e) => {
-        L.DomEvent.stop(e);
-        displayVehicleDetails(e.target);
-      });
-      marker.addTo(vehicleLayer);
+  const setLineVisibility = () => {
+    allRouteLayers.forEach((layers, routeId) => {
+      const { type } = getRouteStyle(routeId);
+      const sysVisible = qs(`.system-toggle[data-system="${type}"]`)?.checked ?? true;
+      const visible = sysVisible && (showAllLines || routeId === selectedRouteId);
+      Object.values(layers).forEach((lg) => (visible ? map.addLayer(lg) : map.removeLayer(lg)));
     });
+  };
+
+  /* ============================================================
+     VEHICLES + INTERPOLATION
+     ============================================================ */
+  const getVehiclesForSelection = () => {
+    let list = selectedRouteId ? allVehicleData.vehicles.filter((v) => v.relationships.route.data.id === selectedRouteId) : [];
+    if (crrcOnly) list = list.filter(isCrrcVehicle);
+    return list;
+  };
+  // Build a vehicle icon. Bearing is derived from the ROUTE TANGENT (direction
+  // of travel) when we know the along-route distance; otherwise from the API
+  // bearing field. The SVG arrow tip points up (north) at 0°.
+  const buildVehicleIcon = (v, headingDeg) => {
+    const { color } = getRouteStyle(v.relationships.route.data.id);
+    const crrc = isCrrcVehicle(v);
+    const delayed = (vehicleDelays.get(v.id) || 0) >= 180;
+    const cls = ["vehicle-icon-svg"];
+    if (crrc) cls.push("crrc");
+    if (delayed) cls.push("delayed");
+    if (v.id === selectedVehicleId) cls.push("active");
+    const deg = headingDeg != null ? headingDeg : (v.attributes.bearing || 0);
+    return L.divIcon({ className: "", iconSize: [26, 26],
+      html: `<svg class="${cls.join(" ")}" style="--bearing:${deg}deg" width="26" height="26" viewBox="0 0 32 32"><path fill="${color}" d="M16 3 L27 27 L16 21 L5 27 Z"/></svg>` });
+  };
+
+  // Along-route heading in the direction the train is moving.
+  const headingForState = (routeId, dist, forward) => {
+    let deg = bearingAtDistance(routeId, dist);
+    if (deg == null) return null;
+    if (forward === false) deg = (deg + 180) % 360; // travelling toward decreasing distance
+    return deg;
+  };
+
+  const plotVehicles = (vehicles, included) => {
+    if (!vehicles) vehicles = [];
+    const seen = new Set();
+    vehicles.forEach((v) => {
+      const { latitude, longitude, speed } = v.attributes;
+      if (latitude == null || longitude == null) return;
+      const routeId = v.relationships.route.data.id;
+      const { type } = getRouteStyle(routeId);
+      seen.add(v.id);
+
+      const hasDist = routeCumDist.has(routeId);
+      const targetDist = hasDist ? distanceAlongRoute(routeId, L.latLng(latitude, longitude)) : null;
+      const rawTarget = [latitude, longitude];
+      const target = hasDist && targetDist != null ? positionAtDistance(routeId, targetDist) : rawTarget;
+      // speed: m/s -> km/min
+      const kmPerMin = speed != null ? (speed * 60) / 1000 : type === "Commuter Rail" ? 1.1 : 0.6;
+
+      const ex = interp.get(v.id);
+      if (ex && ex.marker) {
+        // Continue from the CURRENT interpolated distance toward the new report,
+        // advancing along the route (double interpolation: elapsed×speed drives it).
+        ex.fromDist = ex.curDist != null ? ex.curDist : ex.toDist;
+        ex.toDist = targetDist;
+        ex.start = performance.now(); ex.dur = VEHICLE_UPDATE_MS;
+        ex.vehicle = v; ex.routeId = routeId; ex.hasDist = hasDist;
+        ex.kmPerMin = kmPerMin; ex.rawTarget = rawTarget;
+        ex.forward = targetDist != null && ex.fromDist != null ? targetDist >= ex.fromDist : true;
+      } else {
+        const marker = L.marker(target, { icon: buildVehicleIcon(v), zIndexOffset: 1000, vehicleData: v });
+        updateVehicleTooltip(marker, v, type);
+        marker.on("click", (e) => { L.DomEvent.stop(e); displayVehicleDetails(marker); });
+        marker.addTo(vehicleLayer);
+        interp.set(v.id, {
+          marker, routeId, hasDist, vehicle: v, kmPerMin, rawTarget,
+          fromDist: targetDist, toDist: targetDist, curDist: targetDist,
+          start: performance.now(), dur: VEHICLE_UPDATE_MS, forward: true,
+          fromPos: target, toPos: target,
+        });
+        // initial heading
+        if (hasDist && targetDist != null) marker.setIcon(buildVehicleIcon(v, headingForState(routeId, targetDist, true)));
+      }
+    });
+    interp.forEach((st, id) => { if (!seen.has(id)) { if (st.marker) vehicleLayer.removeLayer(st.marker); interp.delete(id); } });
+    startAnimation();
+  };
+
+  const updateVehicleTooltip = (marker, v, type) => {
+    const crrc = isCrrcVehicle(v);
+    const stopId = v.relationships.stop?.data?.id;
+    const nextStop = stopIdToName.get(stopId);
+    const status = (v.attributes.current_status || "").replace(/_/g, " ").toLowerCase();
+    // richer hover tooltip
+    const text = isDeveloperMode
+      ? v.id
+      : `<b>${crrc ? "✦ " : ""}Train ${v.attributes.label || v.id}</b>${nextStop ? `<br><span style="opacity:.75">${status || "next"}: ${nextStop}</span>` : status ? `<br><span style="opacity:.75">${status}</span>` : ""}`;
+    const opts = { className: "vehicle-hover-tooltip", permanent: type === "Commuter Rail", direction: "right", offset: [12, 0] };
+    if (type === "Commuter Rail") opts.className += " cr-vehicle-tooltip";
+    marker.unbindTooltip(); marker.bindTooltip(text, opts);
+  };
+
+  const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+
+  const animateVehicles = () => {
+    const now = performance.now();
+    interp.forEach((st) => {
+      if (!st.marker) return;
+      const elapsedMin = (now - st.start) / 60000;
+      const t = Math.min(1, (now - st.start) / st.dur);
+      if (st.hasDist && st.toDist != null && st.fromDist != null) {
+        // Route-following double interpolation:
+        //  (a) eased blend from the last shown distance to the new reported
+        //      distance (corrects position when a new report arrives), plus
+        //  (b) a dead-reckoning push of elapsed × speed so a moving train keeps
+        //      gliding ALONG the track between identical/late reports instead of
+        //      freezing. Capped so it never overshoots the next report by much.
+        const dir = st.forward === false ? -1 : 1;
+        const moving = st.vehicle.attributes.current_status !== "STOPPED_AT" && st.kmPerMin > 0.01;
+        const eased = st.fromDist + (st.toDist - st.fromDist) * easeInOut(t);
+        let creep = moving ? dir * st.kmPerMin * elapsedMin : 0;
+        // cap creep so we don't drift more than ~1 stop past the report
+        creep = Math.max(-1.2, Math.min(1.2, creep));
+        st.curDist = eased + creep;
+        const pos = positionAtDistance(st.routeId, st.curDist);
+        if (pos) st.marker.setLatLng(pos);
+        // heading along the track
+        const deg = headingForState(st.routeId, st.curDist, st.forward);
+        if (deg != null && Math.abs((st._lastDeg ?? -999) - deg) > 1.5) {
+          st._lastDeg = deg;
+          st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
+          reapplyTooltip(st);
+        }
+      } else {
+        // Fallback straight lerp between raw positions.
+        const a = st.fromPos || st.rawTarget, b = st.rawTarget;
+        const e = easeInOut(t);
+        st.marker.setLatLng([a[0] + (b[0] - a[0]) * e, a[1] + (b[1] - a[1]) * e]);
+      }
+    });
+    animationFrame = interp.size > 0 ? requestAnimationFrame(animateVehicles) : null;
+  };
+  const reapplyTooltip = (st) => {
+    const { type } = getRouteStyle(st.routeId);
+    updateVehicleTooltip(st.marker, st.vehicle, type);
+  };
+  const startAnimation = () => { if (!animationFrame && interp.size > 0) animationFrame = requestAnimationFrame(animateVehicles); };
+
+  /* ============================================================
+     DELAY + VEHICLE PANEL + TRIP TRACKER
+     ============================================================ */
+  const delayBadge = (sec) => {
+    if (sec == null) return "";
+    const m = Math.round(sec / 60);
+    if (m <= 0) return `<span class="badge ontime">On time</span>`;
+    return `<span class="badge late">${m}m late</span>`;
+  };
+  const computeVehicleDelay = async (v) => {
+    const tripId = v.relationships.trip?.data?.id;
+    if (!tripId) return null;
+    try {
+      const data = await mbtaApi.tripPredictions(tripId);
+      const inc = new Map((data.included || []).map((i) => [`${i.type}:${i.id}`, i]));
+      const seq = v.attributes.current_stop_sequence;
+      const upcoming = data.data.filter((p) => p.attributes.arrival_time || p.attributes.departure_time)
+        .sort((a, b) => a.attributes.stop_sequence - b.attributes.stop_sequence);
+      const next = upcoming.find((p) => p.attributes.stop_sequence >= seq) || upcoming[0];
+      let delay = null;
+      if (next) {
+        const sid = next.relationships?.schedule?.data?.id;
+        const sched = sid ? inc.get(`schedule:${sid}`) : null;
+        if (sched) {
+          const pT = new Date(next.attributes.arrival_time || next.attributes.departure_time);
+          const sT = new Date(sched.attributes.arrival_time || sched.attributes.departure_time);
+          delay = Math.round((pT - sT) / 1000);
+          vehicleDelays.set(v.id, delay);
+        }
+      }
+      return { delay, predictions: upcoming, included: inc };
+    } catch { return null; }
   };
 
   const displayVehicleDetails = (marker) => {
-    [lineInfoOverlay, stationInfoOverlay].forEach((o) =>
-      o.classList.add("hidden")
-    );
-
-    const { vehicleData, includedData } = marker.options;
-    selectedVehicleId = vehicleData.id;
-
-    const { label, current_status, updated_at } = vehicleData.attributes;
-    const stopId = vehicleData.relationships.stop.data?.id;
-    const tripId = vehicleData.relationships.trip.data?.id;
-    const nextStopName = includedData.get(stopId)?.name || "N/A";
-    const trip = includedData.get(tripId);
-    const direction =
-      trip &&
-      routeDataCache.find((r) => r.id === selectedRouteId)?.attributes
-        .direction_names[trip.direction_id]
-        ? routeDataCache.find((r) => r.id === selectedRouteId)?.attributes
-            .direction_names[trip.direction_id]
-        : "N/A";
-
-    const headerText = isDeveloperMode
-      ? vehicleData.id
-      : `Vehicle ${label || "Details"}`;
-    const content = `
-            <button class="close-button">&times;</button>
-            <h4 class="info-header">${headerText}</h4>
-            <div class="info-content">
-                <div class="info-row"><span class="info-label">Status</span><span class="capitalize">${current_status.replace(
-                  /_/g,
-                  " "
-                )}</span></div>
-                <div class="info-row"><span class="info-label">Direction</span><span>${direction}</span></div>
-                <div class="info-row"><span class="info-label">Next Stop</span><span class="text-right">${nextStopName}</span></div>
-                <div class="info-row"><span class="info-label">Updated</span><span class="text-right">${formatRelativeTime(
-                  updated_at
-                )}</span></div>
-            </div>`;
-
-    vehicleInfoOverlay.innerHTML = content;
-    vehicleInfoOverlay.classList.remove("hidden");
-    vehicleInfoOverlay.querySelector(".close-button").onclick = () => {
-      selectedVehicleId = null;
-      vehicleInfoOverlay.classList.add("hidden");
-      const routeVehicles = allVehicleData.vehicles.filter(
-        (v) => v.relationships.route.data.id === selectedRouteId
-      );
-      plotVehicles(routeVehicles, allVehicleData.included);
-    };
-
-    const routeVehicles = allVehicleData.vehicles.filter(
-      (v) => v.relationships.route.data.id === selectedRouteId
-    );
-    plotVehicles(routeVehicles, allVehicleData.included);
-    map.flyTo(marker.getLatLng(), Math.max(map.getZoom(), 15));
+    [el.lineInfo, el.stationInfo, el.alertDetail].forEach((o) => o.classList.add("hidden"));
+    const v = marker.options.vehicleData;
+    const live = allVehicleData.vehicles.find((x) => x.id === v?.id) || v;
+    if (!live) return;
+    selectedVehicleId = live.id;
+    refreshVehiclePanelData(live);
+    map.flyTo(marker.getLatLng(), Math.max(map.getZoom(), 14));
+    plotVehicles(getVehiclesForSelection(), allVehicleData.included);
   };
 
-  // --- INFO PANELS ---
-  const showInfoPanel = (panel, title, content, onClose = () => {}) => {
-    document
-      .querySelectorAll(".info-overlay")
-      .forEach((p) => p.classList.add("hidden"));
-    const html = `<button class="close-button">&times;</button><h4 class="info-header">${title}</h4><div class="info-content">${content}</div>`;
-    panel.innerHTML = html;
-    panel.classList.remove("hidden");
-    panel.querySelector(".close-button").onclick = () => {
-      panel.classList.add("hidden");
-      onClose();
-    };
+  // Draw prev/current/next stop rings around the watched train so its immediate
+  // context on the line is obvious.
+  const drawVehicleContext = (v, res) => {
+    vehicleCtxLayer.clearLayers();
+    if (selectedVehicleId !== v.id || !res || !res.predictions) return;
+    const { color } = getRouteStyle(v.relationships.route.data.id);
+    const seq = v.attributes.current_stop_sequence;
+    const inc = res.included;
+    const sorted = res.predictions.slice().sort((a, b) => a.attributes.stop_sequence - b.attributes.stop_sequence);
+    const idx = sorted.findIndex((p) => p.attributes.stop_sequence >= seq);
+    const pick = [sorted[idx - 1], sorted[idx], sorted[idx + 1]].filter(Boolean);
+    pick.forEach((p, i) => {
+      const sid = p.relationships?.stop?.data?.id;
+      const stopObj = inc.get(`stop:${sid}`);
+      const name = stopObj?.attributes?.name || stopIdToName.get(sid);
+      const loc = stopObj?.attributes ? [stopObj.attributes.latitude, stopObj.attributes.longitude] : graph.get(name)?.location;
+      if (!loc || loc[0] == null) return;
+      const isNext = i === pick.length - 1 && p.attributes.stop_sequence >= seq;
+      L.circleMarker(loc, {
+        radius: 9, color, weight: 3, fillColor: color, fillOpacity: 0.15, className: isNext ? "ctx-ring" : "",
+      }).addTo(vehicleCtxLayer).bindTooltip(name || "", { direction: "top", offset: [0, -8], className: "station-name-tooltip", permanent: true });
+    });
   };
 
-  const showStationInfo = (stationName, shouldSelectLine = true) => {
-    if (shouldSelectLine) {
-      const servicingData = stationToRoutesMap.get(stationName);
-      if (servicingData && servicingData.routes.size > 0) {
-        const primaryRoute =
-          Array.from(servicingData.routes).find((r) => !r.startsWith("CR-")) ||
-          Array.from(servicingData.routes)[0];
-        const routeType = getRouteType(primaryRoute);
-        const systemVisible = querySel(
-          `.system-toggle[data-system="${routeType}"]`
-        ).checked;
-        if (systemVisible) {
-          selectRoute(primaryRoute, false);
-        } else {
-          deselectAll();
-        }
-      }
+  const refreshVehiclePanelData = (v) => {
+    const lookup = new Map(allVehicleData.included?.map((i) => [i.id, i]));
+    const { label, current_status, updated_at, speed } = v.attributes;
+    const routeId = v.relationships.route.data.id;
+    const { color } = getRouteStyle(routeId);
+    const crrc = isCrrcVehicle(v);
+    const tripId = v.relationships.trip?.data?.id;
+    const stopId = v.relationships.stop?.data?.id;
+    const nextStop = stopIdToName.get(stopId) || lookup.get(stopId)?.attributes?.name || "N/A";
+    const trip = lookup.get(tripId);
+    const headsign = trip?.attributes?.headsign;
+    const cars = (v.attributes.carriages || []).map((c) => c.label).filter(Boolean);
+    const occ = (v.attributes.carriages || []).map((c) => c.occupancy_status).filter(Boolean);
+    const occTxt = occ.length ? occ[0].replace(/_/g, " ").toLowerCase() : null;
+
+    el.vehicleInfo.innerHTML = `
+      <button class="close-button">&times;</button>
+      <h4 class="info-header" style="color:${color}">${isDeveloperMode ? v.id : `Train ${label || "—"}`}
+        ${crrc ? '<span class="badge new">New CRRC</span>' : ""}<span id="veh-delay-badge"></span></h4>
+      <div class="info-subheader">${routeLongName(routeId)}${headsign ? " → " + headsign : ""}</div>
+      <div class="info-content">
+        <div class="info-row"><span class="info-label">Status</span><span class="info-value" style="text-transform:capitalize">${(current_status || "").replace(/_/g, " ").toLowerCase()}</span></div>
+        <div class="info-row"><span class="info-label">Next stop</span><span class="info-value">${nextStop}</span></div>
+        ${speed != null ? `<div class="info-row"><span class="info-label">Speed</span><span class="info-value">${Math.round(speed * 2.237)} mph</span></div>` : ""}
+        ${cars.length ? `<div class="info-row"><span class="info-label">Cars</span><span class="info-value">${cars.join(", ")}</span></div>` : ""}
+        ${occTxt ? `<div class="info-row"><span class="info-label">Occupancy</span><span class="info-value" style="text-transform:capitalize">${occTxt}</span></div>` : ""}
+        <div class="info-row"><span class="info-label">Updated</span><span class="info-value">${formatRelativeTime(updated_at)}</span></div>
+      </div>
+      <div class="section-title">Trip tracker</div>
+      <div id="trip-timeline" class="trip-timeline"><p class="empty-note">Loading trip…</p></div>`;
+    el.vehicleInfo.classList.remove("hidden");
+    el.vehicleInfo.querySelector(".close-button").onclick = () => {
+      selectedVehicleId = null; el.vehicleInfo.classList.add("hidden");
+      vehicleCtxLayer.clearLayers();
+      plotVehicles(getVehiclesForSelection(), allVehicleData.included);
+    };
+    computeVehicleDelay(v).then((res) => {
+      if (selectedVehicleId !== v.id) return;
+      const b = getEl("veh-delay-badge");
+      if (b && res && res.delay != null) b.innerHTML = delayBadge(res.delay);
+      renderTripTimeline(v, res, color);
+      drawVehicleContext(v, res);
+      plotVehicles(getVehiclesForSelection(), allVehicleData.included);
+    });
+  };
+
+  const renderTripTimeline = (v, res, color) => {
+    const c = getEl("trip-timeline");
+    if (!c) return;
+    if (!res || !res.predictions || !res.predictions.length) { c.innerHTML = `<p class="empty-note">No trip data available.</p>`; return; }
+    const seq = v.attributes.current_stop_sequence, inc = res.included;
+    c.innerHTML = res.predictions.map((p) => {
+      const sid = p.relationships?.stop?.data?.id;
+      const name = inc.get(`stop:${sid}`)?.attributes?.name || stopIdToName.get(sid) || sid || "Stop";
+      const s = p.attributes.stop_sequence;
+      const t = p.attributes.arrival_time || p.attributes.departure_time;
+      const passed = s < seq, current = s === seq;
+      const timeStr = current ? "Here" : passed ? "" : (formatArrivalTime(t) || clockTime(t));
+      return `<div class="trip-stop ${passed ? "passed" : current ? "current" : ""}">
+        <div class="dot-col"><span class="t-dot" style="background:${passed ? "#6b6b73" : color}"></span>
+        <span class="t-line" style="background:${passed ? "#2a2a30" : color}"></span></div>
+        <span class="t-name">${name}</span><span class="t-time">${timeStr}</span></div>`;
+    }).join("");
+  };
+
+  /* ============================================================
+     STATION INFO + PREDICTIONS
+     ============================================================ */
+  const showStationInfo = (stationName, selectLine = true) => {
+    const servicing = stationToRoutesMap.get(stationName);
+    if (!servicing) return;
+    if (selectLine && servicing.routes.size) {
+      const primary = [...servicing.routes].find((r) => !r.startsWith("CR-")) || [...servicing.routes][0];
+      const t = getRouteType(primary);
+      if (qs(`.system-toggle[data-system="${t}"]`)?.checked) selectRoute(primary, false); else deselectAll();
     }
-
-    const servicingData = stationToRoutesMap.get(stationName);
-    if (!servicingData) return;
-
-    const title = isDeveloperMode ? servicingData.id : stationName;
-    const routeListHtml = Array.from(servicingData.routes)
-      .map((routeId) => {
-        const { color } = getRouteStyle(routeId);
-        const name = isDeveloperMode
-          ? routeId
-          : routeDataCache.find((r) => r.id === routeId)?.attributes
-              .long_name || routeId;
-        return `<div class="flex items-center p-1"><span class="w-3 h-3 rounded-full mr-3" style="background-color: ${color}"></span>${name}</div>`;
-      })
-      .join("");
-
-    const content = `
-            <div class="space-y-1">${routeListHtml}</div>
-            <div class="mt-3">
-                <h5 class="font-bold text-sm">Upcoming Arrivals</h5>
-                <div id="prediction-list" class="mt-1 text-xs">Loading...</div>
-            </div>`;
-
-    showInfoPanel(stationInfoOverlay, title, content, () => deselectAll());
-    fetchAndDisplayPredictions(servicingData.id);
-
-    if (servicingData.location) {
-      map.flyTo(servicingData.location, Math.max(map.getZoom(), 16), {
-        animate: true,
-        duration: 0.5,
-      });
-    }
+    const routeListHtml = [...servicing.routes].map((rId) => {
+      const { color } = getRouteStyle(rId);
+      return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0"><span style="width:11px;height:11px;border-radius:3px;background:${color}"></span>${isDeveloperMode ? rId : routeLongName(rId)}</div>`;
+    }).join("");
+    el.stationInfo.innerHTML = `<button class="close-button">&times;</button>
+      <h4 class="info-header">${isDeveloperMode ? servicing.id : stationName}</h4>
+      <div class="info-content"><div>${routeListHtml}</div>
+      <div style="display:flex;gap:8px;margin-top:12px"><button class="mini-plan-btn" data-dir="from">Trip from here</button><button class="mini-plan-btn" data-dir="to">Trip to here</button></div>
+      <div class="section-title">Upcoming arrivals</div><div id="prediction-list"><p class="empty-note">Loading…</p></div></div>`;
+    qsa(".info-overlay").forEach((p) => { if (p !== el.stationInfo) p.classList.add("hidden"); });
+    el.stationInfo.classList.remove("hidden");
+    el.stationInfo.querySelector(".close-button").onclick = () => { el.stationInfo.classList.add("hidden"); deselectAll(); };
+    el.stationInfo.querySelectorAll(".mini-plan-btn").forEach((b) => b.addEventListener("click", () => {
+      switchMainTab("plan");
+      if (b.dataset.dir === "from") { el.planFrom.value = stationName; el.planTo.focus(); }
+      else { el.planTo.value = stationName; el.planFrom.focus(); }
+    }));
+    // style mini buttons
+    el.stationInfo.querySelectorAll(".mini-plan-btn").forEach((b) => {
+      b.style.cssText = "flex:1;padding:8px;background:var(--bg-2);border:1px solid var(--border);border-radius:9px;color:var(--text-1);font:inherit;font-size:0.78rem;font-weight:600;cursor:pointer";
+    });
+    fetchAndDisplayPredictions(servicing.id);
+    if (servicing.location) map.flyTo(servicing.location, Math.max(map.getZoom(), 14), { animate: true, duration: 0.5 });
   };
 
   const fetchAndDisplayPredictions = async (stationId) => {
-    const predictionListEl = getEl("prediction-list");
-    if (!predictionListEl) return;
-
-    // Listen for the prediction data for this specific station
-    socket.once(`prediction-data-${stationId}`, (predictionData) => {
-      const lookup = new Map(
-        predictionData.included?.map((item) => [item.id, item]) || []
-      );
-      const predictionsByDirection = {};
-
-      predictionData.data.forEach((prediction) => {
-        const tripId = prediction.relationships.trip.data?.id;
-        const trip = lookup.get(tripId);
-        if (!trip || !trip.attributes.headsign) {
-          return;
-        }
-
-        const arrivalTime =
-          prediction.attributes.arrival_time ||
-          prediction.attributes.departure_time;
-
-        const directionId = trip.attributes.direction_id;
-        const destination = trip.attributes.headsign;
-        const routeId = prediction.relationships.route.data?.id;
-        if (!routeId) return;
-
-        const { color } = getRouteStyle(routeId);
-
-        const key = `${destination}-${directionId}`;
-        if (!predictionsByDirection[key]) {
-          predictionsByDirection[key] = {
-            destination: destination,
-            color: color,
-            arrivals: [],
-          };
-        }
-
-        if (arrivalTime) {
-          predictionsByDirection[key].arrivals.push(
-            formatArrivalTime(arrivalTime)
-          );
-        }
+    const listEl = getEl("prediction-list");
+    if (!listEl) return;
+    try {
+      const data = await mbtaApi.predictionsForStop(stationId);
+      const inc = new Map((data.included || []).map((i) => [`${i.type}:${i.id}`, i]));
+      const groups = {};
+      data.data.forEach((p) => {
+        const trip = inc.get(`trip:${p.relationships.trip?.data?.id}`);
+        const headsign = trip?.attributes?.headsign;
+        if (!headsign) return;
+        const routeId = p.relationships.route?.data?.id;
+        const f = formatArrivalTime(p.attributes.arrival_time || p.attributes.departure_time);
+        if (!f) return;
+        const key = `${routeId}|${headsign}`;
+        if (!groups[key]) groups[key] = { dest: headsign, color: getRouteStyle(routeId).color, arrivals: [] };
+        if (groups[key].arrivals.length < 3) groups[key].arrivals.push(f);
       });
-
-      const validGroups = Object.values(predictionsByDirection).filter(
-        (group) => group.arrivals.length > 0
-      );
-
-      if (validGroups.length === 0) {
-        predictionListEl.innerHTML = "No upcoming arrivals.";
-        return;
-      }
-
-      let html = '<ul class="space-y-2">';
-      validGroups.forEach((group) => {
-        html += `
-                        <li class="border-b pb-1">
-                            <div class="font-bold flex items-center">
-                                <span class="w-3 h-3 rounded-full mr-2" style="background-color: ${
-                                  group.color
-                                }"></span>
-                                To: ${group.destination}
-                            </div>
-                            <div class="pl-5 text-gray-700">${group.arrivals.join(
-                              ", "
-                            )}</div>
-                        </li>
-                    `;
-      });
-      html += "</ul>";
-      predictionListEl.innerHTML = html;
-    });
-
-    // Request the prediction data from the server
-    socket.emit("request-predictions", stationId);
+      const valid = Object.values(groups).filter((g) => g.arrivals.length);
+      if (!valid.length) { listEl.innerHTML = `<p class="empty-note">No upcoming arrivals.</p>`; return; }
+      listEl.innerHTML = valid.map((g) => `<div class="pred-group"><div class="pred-dest"><span class="pred-dot" style="background:${g.color}"></span>${g.dest}</div>
+        <div class="pred-times">${g.arrivals.map((a) => (a === "Arriving" ? `<span class="now">${a}</span>` : a)).join(" · ")}</div></div>`).join("");
+    } catch { listEl.innerHTML = `<p class="empty-note">Could not load arrivals.</p>`; }
   };
 
+  /* ============================================================
+     LINE INFO PANEL
+     ============================================================ */
   const showLineInfo = (routeId) => {
     const route = routeDataCache.find((r) => r.id === routeId);
     if (!route) return;
     const { type, color } = getRouteStyle(routeId);
-    const routeInfo = routeInfoCache.get(routeId);
-
-    let devContent = "";
-    if (isDeveloperMode) {
-      const shapeNames = routeInfo.shapes.map((s) => s.id).join("<br>");
-      const clickedShapeInfo = lastClickedShapeId
-        ? `<div class="mt-1"><strong>Clicked Shape:</strong> ${lastClickedShapeId}</div>`
-        : "";
-      devContent = `<div class="mt-2 text-xs text-gray-400 p-1 bg-gray-50 rounded"><strong>Loaded Shapes:</strong><br>${
-        shapeNames || "None"
-      }${clickedShapeInfo}</div>`;
-    }
-
-    const destinations = route.attributes.direction_destinations;
-    const stationList = routeInfo.stops
-      .map((stop, index) => {
-        const stationName = isDeveloperMode ? stop.id : stop.attributes.name;
-        let transferIcons = "";
-
-        const transferRoutes = stationToRoutesMap.get(
-          stop.attributes.name
-        )?.routes;
-        if (transferRoutes && transferRoutes.size > 1) {
-          const transferTypes = new Map();
-          transferRoutes.forEach((transferRouteId) => {
-            if (transferRouteId === routeId) return;
-            const style = getRouteStyle(transferRouteId);
-            const key =
-              style.type === "Commuter Rail"
-                ? "CR"
-                : style.type === "Subway" && style.color === "#00843D"
-                ? "Green"
-                : style.color;
-            if (!transferTypes.has(key)) {
-              transferTypes.set(key, style.color);
-            }
-          });
-
-          transferIcons = `<span class="flex items-center ml-auto">${Array.from(
-            transferTypes.values()
-          )
-            .map(
-              (c) =>
-                `<span class="w-2 h-2 rounded-full ml-1" style="background-color: ${c}"></span>`
-            )
-            .join("")}</span>`;
-        }
-
-        let terminusInfo = "";
-        if (index === 0 && destinations[0])
-          terminusInfo = `<span class="text-gray-400 text-xs ml-1">(to ${destinations[0]})</span>`;
-        if (index === routeInfo.stops.length - 1 && destinations[1])
-          terminusInfo = `<span class="text-gray-400 text-xs ml-1">(to ${destinations[1]})</span>`;
-
-        return `<li class="p-1.5 border-b flex items-center">${stationName}${terminusInfo}${transferIcons}</li>`;
-      })
-      .join("");
-
-    const content = `
-            <p class="text-sm text-gray-600">${route.attributes.description} (${type})</p>
-            <div class="mt-3">
-                <h5 class="font-bold text-sm">Active Vehicles</h5>
-                <div id="vehicle-list-container" class="mt-1 text-xs text-gray-500 max-h-48 overflow-y-auto">Loading...</div>
-            </div>
-            <div class="mt-3">
-                 <h5 class="font-bold text-sm">Stations</h5>
-                 <ul id="station-list-container" class="mt-1 text-xs text-gray-500 max-h-48 overflow-y-auto">${stationList}</ul>
-            </div>
-            ${devContent} 
-        `;
-    const title = isDeveloperMode ? route.id : route.attributes.long_name;
-    showInfoPanel(lineInfoOverlay, title, content, deselectAll);
-    const header = lineInfoOverlay.querySelector(".info-header");
-    if (header) header.style.color = color;
+    const info = routeInfoCache.get(routeId);
+    const dests = route.attributes.direction_destinations;
+    const routeAlerts = alertsByRoute.get(routeId) || [];
+    const alertsHtml = routeAlerts.length
+      ? `<div class="section-title">Service alerts (${routeAlerts.length})</div>` + routeAlerts.slice(0, 4).map((a) => {
+          const eff = (a.attributes.effect || "").toLowerCase();
+          return `<div class="alert-card" data-alert-id="${a.id}"><div class="alert-top"><span class="alert-effect eff-${eff || "default"}">${(a.attributes.effect || "info").replace(/_/g, " ")}</span></div><div class="alert-head">${a.attributes.short_header || a.attributes.header || ""}</div></div>`;
+        }).join("")
+      : "";
+    const uniqStops = [];
+    const seen = new Set();
+    info.stops.forEach((s) => { if (!seen.has(s.attributes.name)) { seen.add(s.attributes.name); uniqStops.push(s); } });
+    const stationList = uniqStops.map((stop, i) => {
+      const name = isDeveloperMode ? stop.id : stop.attributes.name;
+      let transfers = "";
+      const tr = stationToRoutesMap.get(stop.attributes.name)?.routes;
+      if (tr && tr.size > 1) {
+        const s2 = new Map();
+        tr.forEach((tId) => { if (tId === routeId) return; const st = getRouteStyle(tId); s2.set(st.type === "Commuter Rail" ? "CR" : st.color, st.color); });
+        transfers = `<span class="transfer-dots">${[...s2.values()].map((c) => `<span style="background:${c}"></span>`).join("")}</span>`;
+      }
+      let term = "";
+      if (i === 0 && dests[0]) term = `<span class="terminus">to ${dests[0]}</span>`;
+      if (i === uniqStops.length - 1 && dests[1]) term = `<span class="terminus">to ${dests[1]}</span>`;
+      return `<li data-station="${stop.attributes.name}">${name} ${term}${transfers}</li>`;
+    }).join("");
+    el.lineInfo.innerHTML = `<button class="close-button">&times;</button>
+      <h4 class="info-header" style="color:${color}">${isDeveloperMode ? route.id : route.attributes.long_name}</h4>
+      <div class="info-subheader">${route.attributes.description || ""} · ${type}</div>
+      <div class="info-content">${alertsHtml}
+        <div class="section-title">Active vehicles</div><div id="vehicle-list-container" class="sub-list"><p class="empty-note">Loading…</p></div>
+        <div class="section-title">Stations (${uniqStops.length})</div><ul id="station-list-container" class="station-list">${stationList}</ul></div>`;
+    qsa(".info-overlay").forEach((p) => { if (p !== el.lineInfo) p.classList.add("hidden"); });
+    el.lineInfo.classList.remove("hidden");
+    el.lineInfo.querySelector(".close-button").onclick = () => { el.lineInfo.classList.add("hidden"); deselectAll(); };
+    el.lineInfo.querySelectorAll(".alert-card").forEach((c) => c.addEventListener("click", () => showAlertDetail(c.dataset.alertId)));
+    el.lineInfo.querySelectorAll("#station-list-container li").forEach((li) => li.addEventListener("click", () => showStationInfo(li.dataset.station, false)));
   };
 
-  const updateLineInfoVehicleList = (routeId, vehicles, includedData) => {
-    if (
-      routeId !== selectedRouteId ||
-      lineInfoOverlay.classList.contains("hidden")
-    )
-      return;
+  const updateLineInfoVehicleList = (routeId, vehicles, included) => {
+    if (routeId !== selectedRouteId || el.lineInfo.classList.contains("hidden")) return;
+    const c = getEl("vehicle-list-container");
+    if (!c) return;
+    if (!vehicles || !vehicles.length) { c.innerHTML = `<p class="empty-note">No active vehicles${crrcOnly ? " (CRRC filter on)" : ""}.</p>`; return; }
+    const lookup = new Map(included?.map((i) => [i.id, i.attributes]));
+    c.innerHTML = vehicles.map((v) => {
+      const stopId = v.relationships.stop?.data?.id;
+      const nextStop = stopIdToName.get(stopId) || lookup.get(stopId)?.name || "N/A";
+      const crrc = isCrrcVehicle(v), delay = vehicleDelays.get(v.id);
+      return `<div class="sub-item" data-vehicle-id="${v.id}"><div class="si-top"><span class="si-title">${isDeveloperMode ? v.id : `Train ${v.attributes.label || v.id}`}</span>
+        ${crrc ? '<span class="badge new">New</span>' : ""}${delay != null ? delayBadge(delay) : ""}</div>
+        <div class="si-meta" style="text-transform:capitalize">${(v.attributes.current_status || "").replace(/_/g, " ").toLowerCase()} · Next: ${nextStop}</div></div>`;
+    }).join("");
+    c.querySelectorAll(".sub-item").forEach((item) => item.addEventListener("click", () => {
+      const st = interp.get(item.dataset.vehicleId);
+      if (st && st.marker) { map.flyTo(st.marker.getLatLng(), Math.max(map.getZoom(), 15)); displayVehicleDetails(st.marker); }
+    }));
+  };
 
-    const container = getEl("vehicle-list-container");
-    if (!container) return;
+  /* ============================================================
+     ALERTS
+     ============================================================ */
+  const severeEffects = ["SHUTTLE", "SUSPENSION", "STATION_CLOSURE", "DETOUR"];
+  const loadAlerts = async () => {
+    try {
+      const data = await mbtaApi.alerts();
+      alertsData = data.data || [];
+      alertsByRoute = new Map();
+      alertsData.forEach((a) => (a.attributes.informed_entity || []).forEach((e) => {
+        if (e.route) { if (!alertsByRoute.has(e.route)) alertsByRoute.set(e.route, []); const arr = alertsByRoute.get(e.route); if (!arr.find((x) => x.id === a.id)) arr.push(a); }
+      }));
+      renderAlertsBanner(); renderAlertsList(); onSearchOrTabChange();
+    } catch (e) { console.warn("Alerts load failed", e); }
+  };
+  const renderAlertsBanner = () => {
+    const severe = alertsData.filter((a) => severeEffects.includes(a.attributes.effect));
+    if (!severe.length) { el.alertsBanner.classList.add("hidden"); return; }
+    el.alertsBanner.classList.remove("hidden");
+    el.alertsBannerText.textContent = severe[0].attributes.short_header || severe[0].attributes.header || "Service disruption";
+    el.alertsBannerCount.textContent = severe.length;
+  };
+  const renderAlertsList = () => {
+    if (!el.alertsList) return;
+    if (!alertsData.length) { el.alertsList.innerHTML = `<p class="empty-note">No active service alerts. 🎉</p>`; return; }
+    const sorted = [...alertsData].sort((a, b) => {
+      const sa = severeEffects.includes(a.attributes.effect) ? 1 : 0, sb = severeEffects.includes(b.attributes.effect) ? 1 : 0;
+      if (sa !== sb) return sb - sa;
+      return (b.attributes.severity || 0) - (a.attributes.severity || 0);
+    });
+    el.alertsList.innerHTML = sorted.map((a) => {
+      const eff = (a.attributes.effect || "").toLowerCase();
+      const routes = (a.attributes.informed_entity || []).map((e) => e.route).filter((v, i, ar) => v && ar.indexOf(v) === i).slice(0, 6);
+      const dots = routes.map((r) => `<span class="alert-route-dot" style="background:${getRouteStyle(r).color}"></span>`).join("");
+      return `<div class="alert-card" data-alert-id="${a.id}"><div class="alert-top"><span class="alert-effect eff-${eff || "default"}">${(a.attributes.effect || "info").replace(/_/g, " ")}</span><span class="alert-routes">${dots}</span></div><div class="alert-head">${a.attributes.short_header || a.attributes.header || ""}</div></div>`;
+    }).join("");
+    el.alertsList.querySelectorAll(".alert-card").forEach((c) => c.addEventListener("click", () => showAlertDetail(c.dataset.alertId)));
+  };
+  const showAlertDetail = (id) => {
+    const a = alertsData.find((x) => x.id === id);
+    if (!a) return;
+    const at = a.attributes, eff = (at.effect || "").toLowerCase();
+    const routes = (at.informed_entity || []).map((e) => e.route).filter((v, i, ar) => v && ar.indexOf(v) === i);
+    qsa(".info-overlay").forEach((p) => p.classList.add("hidden"));
+    el.alertDetail.innerHTML = `<button class="close-button">&times;</button>
+      <h4 class="info-header"><span class="alert-effect eff-${eff || "default"}">${(at.effect || "info").replace(/_/g, " ")}</span></h4>
+      <div class="info-content"><p style="font-weight:600;line-height:1.45;margin:0 0 10px">${at.header || ""}</p>
+      ${at.description ? `<p style="color:var(--text-1);font-size:0.82rem;line-height:1.55;white-space:pre-line">${at.description}</p>` : ""}
+      ${routes.length ? `<div class="section-title">Affected lines</div><div style="display:flex;gap:6px;flex-wrap:wrap">${routes.map((r) => `<span style="display:inline-flex;align-items:center;gap:5px;background:var(--bg-2);padding:4px 9px;border-radius:8px;font-size:0.78rem"><span style="width:10px;height:10px;border-radius:3px;background:${getRouteStyle(r).color}"></span>${routeLongName(r)}</span>`).join("")}</div>` : ""}</div>`;
+    el.alertDetail.classList.remove("hidden");
+    el.alertDetail.querySelector(".close-button").onclick = () => el.alertDetail.classList.add("hidden");
+  };
 
-    if (!vehicles || vehicles.length === 0) {
-      container.innerHTML = `No active vehicles found.`;
-      return;
-    }
+  /* ============================================================
+     JOURNEY PLANNER (network-wide, transfer-aware)
+     ============================================================ */
+  // Typical per-hop ride time cache: `${routeId}|${A}|${B}` -> minutes
+  const hopTimeCache = new Map();
+  const TRANSFER_PENALTY_MIN = 4;      // avg wait+walk at a transfer
+  const DEFAULT_HOP_MIN = { Subway: 2, "Commuter Rail": 4, Ferry: 8, Other: 3 };
 
-    const lookup = new Map(
-      includedData?.map((item) => [item.id, item.attributes])
-    );
-    const listHtml = vehicles
-      .map((vehicle) => {
-        const { label, current_status } = vehicle.attributes;
-        const stopId = vehicle.relationships.stop.data?.id;
-        const nextStopName = lookup.get(stopId)?.name || "N/A";
-        const displayName = isDeveloperMode
-          ? vehicle.id
-          : `Train ${label || vehicle.id}`;
-        return `
-                <li class="p-2 hover:bg-gray-100 rounded-md cursor-pointer border-b" data-vehicle-id="${
-                  vehicle.id
-                }">
-                    <div class="font-bold">${displayName}</div>
-                    <div class="text-gray-600 text-xs">Status: <span class="capitalize">${current_status.replace(
-                      /_/g,
-                      " "
-                    )}</span></div>
-                    <div class="text-gray-600 text-xs">Next Stop: ${nextStopName}</div>
-                </li>
-            `;
-      })
-      .join("");
+  const stationNames = () => [...graph.keys()].sort();
 
-    container.innerHTML = `<ul class="space-y-1">${listHtml}</ul>`;
-
-    container.querySelectorAll("li").forEach((item) => {
-      item.addEventListener("click", () => {
-        const vehicleId = item.dataset.vehicleId;
-        const marker = vehicleLayer
-          .getLayers()
-          .find((l) => l.options.vehicleData?.id === vehicleId);
-        if (marker) {
-          map.flyTo(marker.getLatLng(), Math.max(map.getZoom(), 16), {
-            animate: true,
-            duration: 0.5,
-          });
-          selectedVehicleId = vehicleId;
-          plotVehicles(vehicles, includedData);
-        }
-      });
+  const populatePlanner = () => {
+    setupStationAutocomplete(el.planFrom, el.planFromSuggest);
+    setupStationAutocomplete(el.planTo, el.planToSuggest);
+    el.planGo.addEventListener("click", runPlanner);
+    el.planSwap.addEventListener("click", () => {
+      const a = el.planFrom.value; el.planFrom.value = el.planTo.value; el.planTo.value = a;
     });
   };
 
-  // --- SELECTION & STATE LOGIC ---
-  const selectRoute = (routeId, shouldShowInfo = true) => {
-    if (selectedRouteId === routeId) {
-      if (shouldShowInfo) showLineInfo(routeId);
-      return;
+  const setupStationAutocomplete = (input, box) => {
+    let hi = -1;
+    const render = () => {
+      const q = input.value.trim().toLowerCase();
+      if (q.length < 2) { box.classList.add("hidden"); return; }
+      const matches = stationNames().filter((n) => n.toLowerCase().includes(q)).slice(0, 8);
+      if (!matches.length) { box.classList.add("hidden"); return; }
+      hi = -1;
+      box.innerHTML = matches.map((n) => {
+        const routes = [...(graph.get(n)?.routes || [])];
+        const dots = routes.slice(0, 5).map((r) => `<span style="background:${getRouteStyle(r).color}"></span>`).join("");
+        return `<div class="suggest-item" data-name="${n.replace(/"/g, "&quot;")}">${n}<span class="s-dots">${dots}</span></div>`;
+      }).join("");
+      box.classList.remove("hidden");
+      box.querySelectorAll(".suggest-item").forEach((it) => it.addEventListener("mousedown", (e) => {
+        e.preventDefault(); input.value = it.dataset.name; box.classList.add("hidden");
+      }));
+    };
+    input.addEventListener("input", render);
+    input.addEventListener("focus", render);
+    input.addEventListener("blur", () => setTimeout(() => box.classList.add("hidden"), 150));
+    input.addEventListener("keydown", (e) => {
+      const items = [...box.querySelectorAll(".suggest-item")];
+      if (!items.length) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); hi = Math.min(hi + 1, items.length - 1); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); hi = Math.max(hi - 1, 0); }
+      else if (e.key === "Enter" && hi >= 0) { e.preventDefault(); input.value = items[hi].dataset.name; box.classList.add("hidden"); return; }
+      else return;
+      items.forEach((it, i) => it.classList.toggle("hi", i === hi));
+    });
+  };
+
+  // Dijkstra across the station graph. State cost = minutes; transfers add penalty.
+  // Returns array of legs: {routeId, type, stops:[names], from, to}
+  const planRoute = (fromName, toName) => {
+    if (!graph.has(fromName) || !graph.has(toName)) return null;
+    if (fromName === toName) return [];
+    // Priority queue via simple array (network is small ~250 nodes)
+    const dist = new Map();     // key `${station}|${route}` -> minutes
+    const prev = new Map();     // key -> { station, route }
+    const startKeys = [];
+    // Start: can board any route at fromName; also a "walk" pseudo-route null
+    graph.get(fromName).routes.forEach((r) => {
+      const k = `${fromName}|${r}`; dist.set(k, 0); startKeys.push(k);
+    });
+    const pq = startKeys.map((k) => ({ k, d: 0 }));
+    const visited = new Set();
+    let endKey = null;
+
+    while (pq.length) {
+      pq.sort((a, b) => a.d - b.d);
+      const { k, d } = pq.shift();
+      if (visited.has(k)) continue;
+      visited.add(k);
+      const [station, route] = splitKey(k);
+      if (station === toName) { endKey = k; break; }
+      const node = graph.get(station);
+      if (!node) continue;
+      // 1) Continue riding current route to neighbors
+      const nbrs = node.neighbors.get(route);
+      if (nbrs) nbrs.forEach((nb) => {
+        const cost = hopTime(route, station, nb);
+        relax(`${nb}|${route}`, d + cost, { station, route }, dist, prev, pq);
+      });
+      // 2) Transfer to another route at this station (penalty)
+      node.routes.forEach((r2) => {
+        if (r2 === route) return;
+        relax(`${station}|${r2}`, d + TRANSFER_PENALTY_MIN, { station, route }, dist, prev, pq);
+      });
+    }
+    if (!endKey) {
+      // fallback: reach toName on any route
+      let best = null, bd = Infinity;
+      dist.forEach((v, k) => { if (splitKey(k)[0] === toName && v < bd) { bd = v; best = k; } });
+      if (!best) return null;
+      endKey = best;
+    }
+    // Reconstruct path of {station, route}
+    const path = [];
+    let cur = endKey;
+    while (cur) {
+      const [st, rt] = splitKey(cur);
+      path.unshift({ station: st, route: rt });
+      const p = prev.get(cur);
+      cur = p ? `${p.station}|${p.route}` : null;
+      if (path.length > 400) break;
+    }
+    return pathToLegs(path);
+  };
+
+  const splitKey = (k) => { const i = k.lastIndexOf("|"); return [k.slice(0, i), k.slice(i + 1)]; };
+  const relax = (nk, nd, from, dist, prev, pq) => {
+    if (nd < (dist.get(nk) ?? Infinity)) { dist.set(nk, nd); prev.set(nk, from); pq.push({ k: nk, d: nd }); }
+  };
+  const hopTime = (route, a, b) => {
+    const key = `${route}|${a}|${b}`;
+    if (hopTimeCache.has(key)) return hopTimeCache.get(key);
+    const rk = `${route}|${b}|${a}`;
+    if (hopTimeCache.has(rk)) return hopTimeCache.get(rk);
+    // distance-based fallback
+    const na = graph.get(a), nb = graph.get(b);
+    if (na && nb) {
+      const km = haversine(na.location, nb.location);
+      const { type } = getRouteStyle(route);
+      const speed = type === "Commuter Rail" ? 0.9 : type === "Ferry" ? 0.5 : 0.55; // km per min
+      return Math.max(1, km / speed);
+    }
+    return DEFAULT_HOP_MIN[getRouteStyle(route).type] || 3;
+  };
+
+  // Collapse consecutive same-route steps into legs.
+  const pathToLegs = (path) => {
+    const legs = [];
+    let i = 0;
+    while (i < path.length - 1) {
+      const route = path[i + 1].route === path[i].route ? path[i].route : path[i + 1].route;
+      // Determine the route used to travel from path[i] to path[i+1]:
+      // if station changes, it's the route on path[i+1]; if only route changes (transfer), skip.
+      if (path[i].station === path[i + 1].station) { i++; continue; } // transfer node
+      const legRoute = path[i + 1].route;
+      const stops = [path[i].station];
+      let j = i;
+      while (j < path.length - 1 && path[j + 1].route === legRoute && path[j + 1].station !== path[j].station) {
+        stops.push(path[j + 1].station); j++;
+      }
+      legs.push({ routeId: legRoute, type: getRouteStyle(legRoute).type, from: stops[0], to: stops[stops.length - 1], stops });
+      i = j;
+    }
+    // merge legs that are same route back-to-back
+    const merged = [];
+    legs.forEach((lg) => {
+      const last = merged[merged.length - 1];
+      if (last && last.routeId === lg.routeId && last.to === lg.from) {
+        last.to = lg.to; last.stops = last.stops.concat(lg.stops.slice(1));
+      } else merged.push(lg);
+    });
+    return merged;
+  };
+
+  // Estimate leg minutes from typical hop times.
+  const legMinutes = (leg) => {
+    let m = 0;
+    for (let i = 0; i < leg.stops.length - 1; i++) m += hopTime(leg.routeId, leg.stops[i], leg.stops[i + 1]);
+    return m;
+  };
+
+  // Find the soonest live/predicted departure for a leg's boarding station toward its direction.
+  const liveDepartureForLeg = async (leg, notBefore) => {
+    const boardStation = stationToRoutesMap.get(leg.from);
+    if (!boardStation) return null;
+    try {
+      const data = await mbtaApi.predictionsForStop(boardStation.id);
+      const inc = new Map((data.included || []).map((i) => [`${i.type}:${i.id}`, i]));
+      const cands = data.data.filter((p) => p.relationships.route?.data?.id === leg.routeId)
+        .map((p) => {
+          const t = p.attributes.departure_time || p.attributes.arrival_time;
+          const trip = inc.get(`trip:${p.relationships.trip?.data?.id}`);
+          return t ? { time: new Date(t), headsign: trip?.attributes?.headsign } : null;
+        })
+        .filter((x) => x && x.time >= notBefore)
+        .sort((a, b) => a.time - b.time);
+      return cands[0] || null;
+    } catch { return null; }
+  };
+
+  const runPlanner = async () => {
+    const from = el.planFrom.value.trim();
+    const to = el.planTo.value.trim();
+    if (!from || !to) { el.planResult.innerHTML = `<p class="empty-note">Enter both a start and destination.</p>`; return; }
+    // normalize to a known station name (case-insensitive / partial)
+    const norm = (v) => graph.has(v) ? v : stationNames().find((n) => n.toLowerCase() === v.toLowerCase()) || stationNames().find((n) => n.toLowerCase().includes(v.toLowerCase()));
+    const fromN = norm(from), toN = norm(to);
+    if (!fromN || !toN) { el.planResult.innerHTML = `<p class="empty-note">Couldn’t find ${!fromN ? `“${from}”` : `“${to}”`}. Pick a station from the suggestions.</p>`; return; }
+    if (fromN === toN) { el.planResult.innerHTML = `<p class="empty-note">Start and destination are the same station.</p>`; return; }
+
+    el.planResult.innerHTML = `<div class="journey-summary"><div class="journey-sub">Finding the best route…</div></div>`;
+
+    const legs = planRoute(fromN, toN);
+    if (!legs || !legs.length) { el.planResult.innerHTML = `<p class="empty-note">No connecting route found between these stations.</p>`; return; }
+
+    const whenVal = el.planWhen.value;
+    const leaveNow = whenVal === "now";
+    let departAt = new Date(Date.now() + (leaveNow ? 0 : parseInt(whenVal, 10) * 60000));
+
+    // Build timeline: for each leg, find catchable departure (live if now), then add ride time.
+    const rendered = [];
+    let cursor = new Date(departAt);
+    let usedLive = false, firstBoard = null;
+
+    for (let i = 0; i < legs.length; i++) {
+      const leg = legs[i];
+      const ride = legMinutes(leg);
+      let board = null;
+      if (leaveNow || i > 0) {
+        board = await liveDepartureForLeg(leg, cursor);
+      }
+      if (board) { usedLive = true; cursor = new Date(board.time); if (i === 0) firstBoard = board.time; }
+      const arrive = new Date(cursor.getTime() + ride * 60000);
+      rendered.push({ leg, ride, boardTime: board ? board.time : null, arriveTime: arrive, headsign: board?.headsign });
+      cursor = new Date(arrive.getTime() + (i < legs.length - 1 ? TRANSFER_PENALTY_MIN * 60000 : 0));
     }
 
+    const totalMin = (cursor.getTime() - departAt.getTime()) / 60000 - (legs.length > 1 ? TRANSFER_PENALTY_MIN : 0);
+    const arriveTime = rendered[rendered.length - 1].arriveTime;
+    renderJourney(fromN, toN, rendered, totalMin, arriveTime, usedLive && leaveNow, departAt);
+    highlightJourneyOnMap(rendered);
+  };
+
+  const renderJourney = (fromN, toN, rendered, totalMin, arriveTime, live, departAt) => {
+    const transfers = rendered.length - 1;
+    const legsHtml = rendered.map((r) => {
+      const { color } = getRouteStyle(r.leg.routeId);
+      const isWalk = false;
+      const label = routeShortLabel(r.leg.routeId);
+      let catchHtml = "";
+      if (r.boardTime) {
+        const mins = Math.round((new Date(r.boardTime) - Date.now()) / 60000);
+        const tight = mins <= 3;
+        catchHtml = `<div class="leg-detail"><span class="catch ${tight ? "tight" : ""}">${mins <= 0 ? "Board now" : `Catch in ${mins} min`}</span> · departs ${clockTime(r.boardTime)}${r.headsign ? ` → ${r.headsign}` : ""}</div>`;
+      } else {
+        catchHtml = `<div class="leg-detail">${routeLongName(r.leg.routeId)}</div>`;
+      }
+      return `<div class="leg" style="--leg-color:${color}">
+        <div class="leg-badge ${isWalk ? "walk" : ""}" style="--leg-color:${color}">${label}</div>
+        <div class="leg-title">${r.leg.from} → ${r.leg.to}</div>
+        ${catchHtml}
+        <div class="transfer-note">${r.leg.stops.length - 1} stop${r.leg.stops.length - 1 === 1 ? "" : "s"} · ~${fmtDuration(r.ride)} · arrive ${clockTime(r.arriveTime)}</div>
+      </div>`;
+    }).join("");
+
+    el.planResult.innerHTML = `
+      <div class="journey-summary">
+        <div class="journey-eta"><span class="big">${fmtDuration(totalMin)}</span>
+          <span class="unit">total</span>
+          <span class="live-tag ${live ? "" : "sched"}">${live ? "Live trains" : "Scheduled"}</span></div>
+        <div class="journey-sub">${fromN} → ${toN}</div>
+        <div class="journey-arrive">${transfers === 0 ? "Direct" : transfers + " transfer" + (transfers > 1 ? "s" : "")} · arrive ~${clockTime(arriveTime)}</div>
+      </div>
+      ${legsHtml}`;
+  };
+
+  const highlightJourneyOnMap = (rendered) => {
+    journeyLayer.clearLayers();
+    const allPts = [];
+    rendered.forEach((r) => {
+      const { color } = getRouteStyle(r.leg.routeId);
+      const pts = r.leg.stops.map((n) => graph.get(n)?.location).filter(Boolean);
+      allPts.push(...pts);
+      if (pts.length >= 2) {
+        L.polyline(pts, { color: "#000", weight: 10, opacity: 0.5, lineCap: "round" }).addTo(journeyLayer);
+        L.polyline(pts, { color, weight: 6, opacity: 1, lineCap: "round" }).addTo(journeyLayer);
+      }
+      // endpoints
+      [r.leg.stops[0], r.leg.stops[r.leg.stops.length - 1]].forEach((n) => {
+        const loc = graph.get(n)?.location;
+        if (loc) L.circleMarker(loc, { radius: 6, fillColor: "#fff", color, weight: 3, fillOpacity: 1 }).addTo(journeyLayer);
+      });
+    });
+    if (allPts.length) map.flyToBounds(L.latLngBounds(allPts).pad(0.2), { animate: true, duration: 0.8 });
+  };
+
+  /* ============================================================
+     SELECTION LOGIC
+     ============================================================ */
+  const selectRoute = (routeId, showInfo = true) => {
+    if (selectedRouteId === routeId) { if (showInfo) showLineInfo(routeId); return; }
     deselectAll(true);
     selectedRouteId = routeId;
-
     const { color, type } = getRouteStyle(routeId);
+    setLineVisibility();
 
-    const activeTab = querySel("#route-tabs .active");
+    switchMainTab("lines");
+    const activeTab = qs("#route-tabs .active");
     if (activeTab && activeTab.dataset.type !== type) {
       activeTab.classList.remove("active");
-      const newTab = querySel(`#route-tabs [data-type="${type}"]`);
-      if (newTab) newTab.classList.add("active");
+      const nt = qs(`#route-tabs [data-type="${type}"]`); if (nt) nt.classList.add("active");
       displayList(type);
     }
-
-    document.querySelectorAll("#list-container a").forEach((a) => {
-      a.classList.remove("active");
-      a.style.backgroundColor = "";
-      a.style.color = "";
-    });
-    const listItem = querySel(`#list-container a[data-id='${routeId}']`);
-    if (listItem) {
-      listItem.classList.add("active");
-      listItem.style.backgroundColor = color + "20";
-      listItem.style.color = color;
-    }
+    qsa("#list-container .list-row").forEach((a) => a.classList.remove("active"));
+    const li = qs(`#list-container .list-row[data-id='${CSS.escape(routeId)}']`);
+    if (li) li.classList.add("active");
 
     allRouteLayers.forEach((layers, id) => {
-      const isSelected = id === selectedRouteId;
-      const style = {
-        weight: isSelected ? 7 : 3,
-        opacity: isSelected ? 0.9 : 0.35,
-      };
-      if (layers.shapes) {
-        layers.shapes.eachLayer((l) => l.setStyle(style));
-        if (isSelected) layers.shapes.bringToFront();
-      }
-      if (layers.stops) {
-        layers.stops.eachLayer((l) => {
-          if (l.setStyle)
-            l.setStyle({
-              radius: isSelected ? (l.options.weight > 2 ? 7 : 5) : 4,
-              opacity: isSelected ? 1 : 0.5,
-              fillOpacity: isSelected ? 1 : 0.5,
-            });
-        });
-        if (isSelected) layers.stops.bringToFront();
-      }
+      const sel = id === selectedRouteId;
+      if (layers.shapes) { layers.shapes.eachLayer((l) => { if (l._isVisibleLine) l.setStyle({ weight: sel ? 6 : 3, opacity: sel ? 0.95 : 0.4 }); }); if (sel) layers.shapes.bringToFront(); }
+      if (layers.stops) { layers.stops.eachLayer((l) => l.setStyle && l.setStyle({ radius: sel ? (l.options.weight > 2 ? 6.5 : 5) : 3, opacity: sel ? 1 : 0.45, fillOpacity: sel ? 1 : 0.45 })); if (sel) layers.stops.bringToFront(); }
     });
 
-    const selectedLayers = allRouteLayers.get(routeId);
-    if (
-      shouldShowInfo &&
-      selectedLayers &&
-      selectedLayers.shapes &&
-      typeof selectedLayers.shapes.getBounds === "function" &&
-      selectedLayers.shapes.getLayers().length > 0
-    ) {
-      map.flyToBounds(selectedLayers.shapes.getBounds().pad(0.1), {
-        animate: true,
-        duration: 0.75,
-      });
-    }
+    const selLayers = allRouteLayers.get(routeId);
+    if (showInfo && selLayers?.shapes?.getLayers().length) map.flyToBounds(selLayers.shapes.getBounds().pad(0.1), { animate: true, duration: 0.75 });
+    if (showInfo) showLineInfo(routeId);
 
-    if (shouldShowInfo) {
-      showLineInfo(routeId);
-    }
+    const rv = getVehiclesForSelection();
+    plotVehicles(rv, allVehicleData.included);
+    if (showInfo) updateLineInfoVehicleList(routeId, rv, allVehicleData.included);
+    // Fetch fresh positions immediately so trains aren't static until the next
+    // 30s server push (esp. in mock mode / on first select).
+    refreshRouteVehiclesNow(routeId);
+  };
 
-    const routeVehicles = allVehicleData.vehicles.filter(
-      (v) => v.relationships.route.data.id === routeId
-    );
-    plotVehicles(routeVehicles, allVehicleData.included);
-    if (shouldShowInfo) {
-      updateLineInfoVehicleList(
-        routeId,
-        routeVehicles,
-        allVehicleData.included
-      );
-    }
+  // Directly pull current vehicles for a route from the MBTA API and merge them
+  // into allVehicleData so plotting reflects live positions without waiting.
+  const refreshRouteVehiclesNow = async (routeId) => {
+    try {
+      const data = await mbtaApi.vehiclesForRoute(routeId);
+      if (selectedRouteId !== routeId) return;
+      const fresh = data.data || [];
+      if (!fresh.length) return;
+      const freshIds = new Set(fresh.map((v) => v.id));
+      const others = allVehicleData.vehicles.filter((v) => v.relationships.route.data.id !== routeId || !freshIds.has(v.id));
+      // replace this route's vehicles with fresh ones
+      const kept = others.filter((v) => v.relationships.route.data.id !== routeId);
+      allVehicleData = {
+        vehicles: kept.concat(fresh),
+        included: mergeIncluded(allVehicleData.included, data.included || []),
+      };
+      lastUpdateTime = Date.now();
+      const rv = getVehiclesForSelection();
+      plotVehicles(rv, allVehicleData.included);
+      updateLineInfoVehicleList(routeId, rv, allVehicleData.included);
+    } catch (e) { /* rate limit or offline — the socket feed still updates */ }
+  };
+  const mergeIncluded = (a = [], b = []) => {
+    const m = new Map(a.map((i) => [`${i.type}:${i.id}`, i]));
+    b.forEach((i) => m.set(`${i.type}:${i.id}`, i));
+    return [...m.values()];
   };
 
   const deselectAll = (soft = false) => {
     lastClickedShapeId = null;
-    if (!soft || isDeveloperMode) {
-      document
-        .querySelectorAll(".info-overlay")
-        .forEach((p) => p.classList.add("hidden"));
-    }
-
+    if (!soft || isDeveloperMode) qsa(".info-overlay").forEach((p) => p.classList.add("hidden"));
     if (soft) return;
-
-    selectedRouteId = null;
-    selectedVehicleId = null;
-    vehicleLayer.clearLayers();
-
-    document.querySelectorAll(".list-item a").forEach((a) => {
-      a.classList.remove("active");
-      a.style.backgroundColor = "";
-      a.style.color = "";
-    });
-
+    selectedRouteId = null; selectedVehicleId = null;
+    vehicleLayer.clearLayers(); interp.clear(); vehicleCtxLayer.clearLayers();
+    qsa(".list-row").forEach((a) => a.classList.remove("active"));
     allRouteLayers.forEach((layers) => {
-      const style = { weight: 3, opacity: 0.35 };
-      if (layers.shapes) layers.shapes.eachLayer((l) => l.setStyle(style));
-      if (layers.stops) {
-        layers.stops.eachLayer((l) => {
-          if (l.setStyle)
-            l.setStyle({ radius: 4, opacity: 0.5, fillOpacity: 0.5 });
-        });
-      }
+      if (layers.shapes) layers.shapes.eachLayer((l) => { if (l._isVisibleLine) l.setStyle({ weight: 3, opacity: 0.4 }); });
+      if (layers.stops) layers.stops.eachLayer((l) => l.setStyle && l.setStyle({ radius: 3, opacity: 0.45, fillOpacity: 0.45 }));
     });
+    setLineVisibility();
   };
 
-  // --- LIVE UPDATES ---
+  /* ============================================================
+     UPDATE TIMER + TABS + EVENTS
+     ============================================================ */
   const startUpdateTimer = () => {
     if (updateTimerInterval) clearInterval(updateTimerInterval);
     updateTimerInterval = setInterval(() => {
-      const secondsAgo = Math.round((Date.now() - lastUpdateTime) / 1000);
-      if (updateTimerDiv)
-        updateTimerDiv.textContent = `Updated ${secondsAgo}s ago`;
+      el.updatePill.textContent = `Updated ${Math.round((Date.now() - lastUpdateTime) / 1000)}s ago`;
     }, 1000);
   };
 
-  // --- EVENT LISTENERS ---
+  const switchMainTab = (name) => {
+    qsa(".main-tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
+    qsa(".tab-panel").forEach((p) => p.classList.toggle("hidden", p.dataset.panel !== name));
+  };
+  el.mainTabs.addEventListener("click", (e) => { const t = e.target.closest(".main-tab"); if (t) switchMainTab(t.dataset.tab); });
+
   const onSearchOrTabChange = () => {
-    const activeTab = querySel("#route-tabs .active");
-    if (activeTab) {
-      const activeType = activeTab.dataset.type;
-      displayList(activeType, searchInput.value);
-    }
+    const t = qs("#route-tabs .active"); if (t) displayList(t.dataset.type, el.searchInput.value);
   };
 
-  if (devModeToggle) {
-    devModeToggle.addEventListener("change", (e) => {
-      isDeveloperMode = e.target.checked;
-      const currentSelected = selectedRouteId;
-      deselectAll();
-      allRouteLayers.forEach((layers, routeId) => {
-        const info = routeInfoCache.get(routeId);
-        if (info) drawRoute(routeId, info, true);
-      });
-      onSearchOrTabChange();
-      if (currentSelected) {
-        selectRoute(currentSelected);
-      }
-    });
-  }
+  el.devToggle.addEventListener("change", (e) => {
+    isDeveloperMode = e.target.checked;
+    const cur = selectedRouteId; deselectAll();
+    allRouteLayers.forEach((layers, id) => { const info = routeInfoCache.get(id); if (info) drawRoute(id, info, true); });
+    onSearchOrTabChange(); if (cur) selectRoute(cur);
+  });
+  el.crrcToggle.addEventListener("change", (e) => {
+    crrcOnly = e.target.checked;
+    plotVehicles(getVehiclesForSelection(), allVehicleData.included);
+    if (selectedRouteId) updateLineInfoVehicleList(selectedRouteId, getVehiclesForSelection(), allVehicleData.included);
+  });
+  el.showAllToggle.addEventListener("change", (e) => { showAllLines = e.target.checked; setLineVisibility(); });
 
-  if (routeTabs) {
-    routeTabs.addEventListener("click", (e) => {
-      if (e.target.classList.contains("route-tab")) {
-        const activeTab = routeTabs.querySelector(".active");
-        if (activeTab) activeTab.classList.remove("active");
-        e.target.classList.add("active");
-        const type = e.target.dataset.type;
-        const { color } = getRouteStyle(type === "Subway" ? "Blue" : type);
-        document
-          .querySelectorAll(".route-tab")
-          .forEach((t) => (t.style.borderColor = "transparent"));
-        e.target.style.setProperty("--active-tab-color", color);
-        searchInput.value = "";
-        onSearchOrTabChange();
-      }
-    });
-  }
-
-  if (searchInput) searchInput.addEventListener("input", onSearchOrTabChange);
-
-  if (listContainer) {
-    listContainer.addEventListener("click", (e) => {
-      const anchor = e.target.closest("a");
-      if (anchor) {
-        e.preventDefault();
-        const { type, id, name } = anchor.dataset;
-        if (type === "route") {
-          selectRoute(id);
-        } else if (type === "station") {
-          showStationInfo(name);
-        }
-      }
-    });
-  }
-
-  document.querySelectorAll(".system-toggle").forEach((toggle) => {
-    toggle.addEventListener("change", function () {
-      const system = this.dataset.system;
-      const isVisible = this.checked;
-
-      if (
-        selectedRouteId &&
-        getRouteType(selectedRouteId).type === system &&
-        !isVisible
-      ) {
-        deselectAll();
-      }
-
-      if (routeDataCache) {
-        routeDataCache.forEach((route) => {
-          if (getRouteType(route.id) === system) {
-            const layers = allRouteLayers.get(route.id);
-            if (layers) {
-              Object.values(layers).forEach((layerGroup) => {
-                isVisible
-                  ? map.addLayer(layerGroup)
-                  : map.removeLayer(layerGroup);
-              });
-            }
-          }
-        });
-      }
-      onSearchOrTabChange();
-    });
+  el.routeTabs.addEventListener("click", (e) => {
+    if (!e.target.classList.contains("route-tab")) return;
+    qs("#route-tabs .active")?.classList.remove("active");
+    e.target.classList.add("active");
+    const { color } = getRouteStyle(e.target.dataset.type === "Subway" ? "Blue" : e.target.dataset.type);
+    e.target.style.setProperty("--active-tab-color", color);
+    el.searchInput.value = ""; onSearchOrTabChange();
+  });
+  el.searchInput.addEventListener("input", onSearchOrTabChange);
+  el.listContainer.addEventListener("click", (e) => {
+    const a = e.target.closest(".list-row"); if (!a) return;
+    e.preventDefault();
+    if (a.dataset.type === "route") selectRoute(a.dataset.id); else showStationInfo(a.dataset.name);
   });
 
-  map.on("click", (e) => {
-    if (e.originalEvent.target === map.getContainer()) {
-      deselectAll();
-    }
+  qsa(".system-toggle").forEach((toggle) => toggle.addEventListener("change", function () {
+    const system = this.dataset.system;
+    if (selectedRouteId && getRouteType(selectedRouteId) === system && !this.checked) deselectAll();
+    setLineVisibility(); onSearchOrTabChange();
+  }));
+
+  map.on("click", (e) => { if (e.originalEvent.target === map.getContainer()) deselectAll(); });
+
+  getEl("settings-button").onclick = () => el.settingsModal.classList.remove("hidden");
+  el.settingsModal.addEventListener("click", (e) => {
+    if (e.target.classList.contains("modal-container") || e.target.closest(".close-button")) el.settingsModal.classList.add("hidden");
   });
+  getEl("alerts-banner-btn").addEventListener("click", () => switchMainTab("alerts"));
 
-  const aboutButton = getEl("about-button");
-  if (aboutButton) {
-    aboutButton.onclick = () => {
-      aboutModal.classList.remove("hidden");
-    };
-  }
-
-  if (aboutModal) {
-    aboutModal.addEventListener("click", (e) => {
-      if (
-        e.target.classList.contains("modal-container") ||
-        e.target.closest(".close-button") ||
-        e.target.closest(".modal-close-button")
-      ) {
-        aboutModal.classList.add("hidden");
-      }
-    });
-  }
+  let resizeRaf = null;
+  window.addEventListener("resize", () => { if (resizeRaf) cancelAnimationFrame(resizeRaf); resizeRaf = requestAnimationFrame(() => map.invalidateSize()); });
 });

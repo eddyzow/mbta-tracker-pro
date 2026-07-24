@@ -2,12 +2,23 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>MBTA Real-Time Tracker</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>MBTA Tracker Pro — Live Boston Transit Map</title>
+    <meta
+      name="description"
+      content="A fast, real-time map of every MBTA train, commuter rail, and ferry. Plan trips around live trains, track delays, service alerts, and the new CRRC trains — an eddyzow.net project."
+    />
+    <meta name="theme-color" content="#000000" />
 
-    <!-- External Libs & Fonts -->
+    <meta property="og:title" content="MBTA Tracker Pro — Live Boston Transit Map" />
+    <meta property="og:description" content="Plan trips around live trains. Real-time MBTA vehicles, delays, alerts, and new-train spotting." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://eddyzow.net/mbta-tracker-pro" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;900&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800;900&display=swap"
       rel="stylesheet"
     />
     <link
@@ -17,215 +28,171 @@
       crossorigin=""
     />
     <link rel="stylesheet" href="style.css" />
-    <script src="https://cdn.tailwindcss.com"></script>
   </head>
 
-  <body class="bg-gray-100 text-gray-800">
-    <!-- Initial Loading Overlay -->
+  <body>
+    <!-- Loading overlay -->
     <div id="loading-overlay">
-      <div
-        class="spinner"
-        style="width: 48px; height: 48px; border-width: 4px"
-      ></div>
-      <p class="mt-6 text-lg font-semibold text-gray-100">
-        Loading Map Data...
-      </p>
+      <div class="loader-logo">MBTA<span>Tracker Pro</span></div>
+      <div class="spinner"></div>
+      <p class="loader-text">Connecting to the live network…</p>
     </div>
 
-    <div class="flex h-screen">
-      <!-- Sidebar -->
-      <aside
-        id="sidebar"
-        class="w-full md:w-1/3 lg:w-1/4 bg-white shadow-lg flex flex-col"
-      >
-        <div
-          class="p-4 border-b border-gray-200 flex justify-between items-center"
-        >
-          <h1 class="text-2xl font-black text-gray-900 tracking-tight">
-            MBTA Tracker
-          </h1>
-          <div class="flex items-center space-x-4">
-            <div
-              id="update-timer"
-              class="text-xs text-gray-500 font-medium"
-            ></div>
-            <button id="about-button" title="About this app">
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                class="h-6 w-6 text-gray-400 hover:text-gray-700 transition-colors"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  stroke-width="2"
-                  d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                />
+    <div class="app-shell">
+      <!-- ============ SIDEBAR ============ -->
+      <aside id="sidebar">
+        <header class="sidebar-header">
+          <div class="brand">
+            <div class="brand-mark">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="9" /><path d="M8 12h8M12 8v8" />
               </svg>
+            </div>
+            <div>
+              <h1>MBTA Tracker <span class="pro">Pro</span></h1>
+              <div id="connection-status" class="conn-status">
+                <span class="conn-dot"></span><span class="conn-label">connecting…</span>
+              </div>
+            </div>
+          </div>
+          <button id="settings-button" class="icon-btn" title="Settings" aria-label="Settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </button>
+        </header>
+
+        <!-- Global alerts banner -->
+        <div id="alerts-banner" class="alerts-banner hidden">
+          <button id="alerts-banner-btn" class="alerts-banner-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round"
+                d="M12 9v4m0 4h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+            </svg>
+            <span id="alerts-banner-text">Loading service alerts…</span>
+            <span id="alerts-banner-count" class="alerts-count">0</span>
+          </button>
+        </div>
+
+        <!-- Primary tabs -->
+        <nav id="main-tabs" class="main-tabs">
+          <button class="main-tab active" data-tab="plan">Plan</button>
+          <button class="main-tab" data-tab="lines">Lines</button>
+          <button class="main-tab" data-tab="alerts">Alerts</button>
+        </nav>
+
+        <!-- ---- PLAN TAB (flagship journey planner) ---- -->
+        <section class="tab-panel" data-panel="plan">
+          <div class="controls plan-controls">
+            <div class="plan-hero">
+              <h2>Where to?</h2>
+              <p class="panel-hint">Plan a trip across the whole network — routed around the trains that are actually running right now.</p>
+            </div>
+
+            <div class="plan-field">
+              <span class="plan-dot from"></span>
+              <input type="text" id="plan-from" class="plan-input" placeholder="From station" autocomplete="off" />
+              <div class="plan-suggest hidden" id="plan-from-suggest"></div>
+            </div>
+            <button id="plan-swap" class="plan-swap" title="Swap" aria-label="Swap from and to">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10l0 8M7 18l-3-3M7 18l3-3M17 14l0-8M17 6l-3 3M17 6l3 3"/></svg>
             </button>
-          </div>
-        </div>
+            <div class="plan-field">
+              <span class="plan-dot to"></span>
+              <input type="text" id="plan-to" class="plan-input" placeholder="To station" autocomplete="off" />
+              <div class="plan-suggest hidden" id="plan-to-suggest"></div>
+            </div>
 
-        <div class="flex-1 flex flex-col overflow-hidden">
-          <!-- System Visibility Toggles -->
-          <div class="p-4 border-b border-gray-200 space-y-3">
-            <h3
-              class="text-sm font-bold text-gray-600 uppercase tracking-wider"
-            >
-              Visible Systems
-            </h3>
-            <div class="flex justify-between items-center">
-              <span class="text-sm font-medium text-gray-700">Subway</span>
-              <label class="slider-switch"
-                ><input
-                  type="checkbox"
-                  class="system-toggle"
-                  data-system="Subway"
-                  checked /><span class="slider-thumb"></span
-              ></label>
+            <div class="plan-when">
+              <label class="field-label">When</label>
+              <select id="plan-when" class="select">
+                <option value="now">Leave now — use live trains</option>
+                <option value="15">In 15 minutes</option>
+                <option value="30">In 30 minutes</option>
+                <option value="60">In 1 hour</option>
+              </select>
             </div>
-            <div class="flex justify-between items-center">
-              <span class="text-sm font-medium text-gray-700"
-                >Commuter Rail</span
-              >
-              <label class="slider-switch"
-                ><input
-                  type="checkbox"
-                  class="system-toggle"
-                  data-system="Commuter Rail"
-                  checked /><span class="slider-thumb"></span
-              ></label>
-            </div>
-            <div class="flex justify-between items-center">
-              <span class="text-sm font-medium text-gray-700">Ferry</span>
-              <label class="slider-switch"
-                ><input
-                  type="checkbox"
-                  class="system-toggle"
-                  data-system="Ferry"
-                  checked /><span class="slider-thumb"></span
-              ></label>
-            </div>
+            <button id="plan-go" class="primary-btn">Plan trip</button>
           </div>
+          <div id="plan-result" class="plan-result"></div>
+        </section>
 
-          <!-- Search & Tabs -->
-          <div class="p-4 border-b border-gray-200">
-            <input
-              type="text"
-              id="search-input"
-              placeholder="Search routes or stations..."
-              class="w-full p-2 border border-gray-300 rounded-md text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-shadow"
-            />
+        <!-- ---- LINES TAB ---- -->
+        <section class="tab-panel hidden" data-panel="lines">
+          <div class="controls">
+            <input type="text" id="search-input" placeholder="Search routes or stations…" autocomplete="off" />
           </div>
-          <div class="border-b border-gray-200">
-            <nav id="route-tabs" class="flex -mb-px px-4">
-              <button class="route-tab active" data-type="Subway">
-                Subway
-              </button>
-              <button class="route-tab" data-type="Commuter Rail">
-                Commuter Rail
-              </button>
-              <button class="route-tab" data-type="Ferry">Ferry</button>
-            </nav>
+          <nav id="route-tabs" class="route-tabs">
+            <button class="route-tab active" data-type="Subway">Subway</button>
+            <button class="route-tab" data-type="Commuter Rail">Rail</button>
+            <button class="route-tab" data-type="Ferry">Ferry</button>
+          </nav>
+          <div id="list-container" class="list-container">
+            <div id="loading-routes" class="list-loading"><div class="spinner"></div></div>
+            <p id="no-results-found" class="empty-note hidden">No results found.</p>
           </div>
+        </section>
 
-          <!-- List Container -->
-          <div id="list-container" class="p-2 flex-1 overflow-y-auto">
-            <div
-              id="loading-routes"
-              class="flex justify-center items-center py-8"
-            >
-              <div class="spinner"></div>
-            </div>
-            <p
-              id="no-results-found"
-              class="text-center text-gray-500 hidden p-4"
-            >
-              No results found.
-            </p>
+        <!-- ---- ALERTS TAB ---- -->
+        <section class="tab-panel hidden" data-panel="alerts">
+          <div class="controls">
+            <p class="panel-hint">Live service alerts, closures, and shuttle diversions across the system.</p>
           </div>
-        </div>
+          <div id="alerts-list" class="list-container"><div class="list-loading"><div class="spinner"></div></div></div>
+        </section>
+
+        <footer class="sidebar-footer">
+          <span>An <a href="https://eddyzow.net" target="_blank" rel="noopener">eddyzow.net</a> project</span>
+          <a href="https://eddyzow.net/mbta" target="_blank" rel="noopener" class="footer-alt">CR Tracker ↗</a>
+        </footer>
       </aside>
 
-      <!-- Main Content: Map -->
-      <main id="map-container" class="w-full md:w-2/3 lg:w-3/4 relative">
+      <!-- ============ MAP ============ -->
+      <main id="map-container">
         <div id="map"></div>
+        <div id="update-pill" class="update-pill">Updated —</div>
 
-        <!-- Info Panels -->
-        <div id="line-info-overlay" class="info-overlay top-right hidden"></div>
-        <div
-          id="station-info-overlay"
-          class="info-overlay top-right hidden"
-        ></div>
-        <div
-          id="vehicle-info-overlay"
-          class="info-overlay top-right hidden"
-        ></div>
+        <div id="line-info-overlay" class="info-overlay hidden"></div>
+        <div id="station-info-overlay" class="info-overlay hidden"></div>
+        <div id="vehicle-info-overlay" class="info-overlay hidden"></div>
+        <div id="alert-detail-overlay" class="info-overlay hidden"></div>
       </main>
     </div>
 
-    <!-- About Modal -->
-    <div id="about-modal" class="modal-container hidden">
-      <div class="modal-content text-left">
-        <div class="flex justify-between items-start">
-          <h3 class="text-lg leading-6 font-medium text-gray-900">
-            About MBTA Tracker
-          </h3>
-          <button class="close-button -mt-2 -mr-2">&times;</button>
+    <!-- Settings modal -->
+    <div id="settings-modal" class="modal-container hidden">
+      <div class="modal-content">
+        <button class="close-button modal-x">&times;</button>
+        <h3 class="modal-title">Settings</h3>
+        <div class="modal-body settings-body">
+          <label class="setting-row">
+            <div><div class="setting-title">Show all lines</div><div class="setting-sub">Draw the whole network faintly on the map</div></div>
+            <span class="slider-switch"><input type="checkbox" id="show-all-toggle" checked /><span class="slider-thumb"></span></span>
+          </label>
+          <label class="setting-row">
+            <div><div class="setting-title">New CRRC trains only</div><div class="setting-sub">Hide older stock; show only new cars</div></div>
+            <span class="slider-switch"><input type="checkbox" id="crrc-only-toggle" /><span class="slider-thumb"></span></span>
+          </label>
+          <div class="setting-row">
+            <div><div class="setting-title">Visible systems</div><div class="setting-sub">Toggle whole modes on the map</div></div>
+          </div>
+          <div class="system-filters" id="system-filters">
+            <label class="chip"><input type="checkbox" class="system-toggle" data-system="Subway" checked /><span>Subway</span></label>
+            <label class="chip"><input type="checkbox" class="system-toggle" data-system="Commuter Rail" checked /><span>Commuter Rail</span></label>
+            <label class="chip"><input type="checkbox" class="system-toggle" data-system="Ferry" checked /><span>Ferry</span></label>
+          </div>
+          <label class="setting-row">
+            <div><div class="setting-title">Developer mode</div><div class="setting-sub">Show raw route, shape &amp; stop IDs</div></div>
+            <span class="slider-switch"><input type="checkbox" id="dev-mode-toggle" /><span class="slider-thumb"></span></span>
+          </label>
         </div>
-        <div class="mt-4 prose prose-sm max-w-none">
-          <p>
-            This tracker was created to provide a beautiful, all-in-one transit
-            solution for the Massachusetts Bay Transportation Authority (MBTA)
-            system, using the official MBTA v3 API.
-          </p>
-
-          <h4 class="font-semibold">Key Features:</h4>
-          <ul>
-            <li>
-              <strong>Live Vehicle Tracking:</strong> See the real-time location
-              of all subway, commuter rail, and ferry vehicles.
-            </li>
-            <li>
-              <strong>Detailed Information:</strong> Click any train, station,
-              or line to get more details, including status, next stops, and
-              transfers.
-            </li>
-            <li>
-              <strong>System Toggles:</strong> Easily show or hide different
-              parts of the MBTA system to focus on what matters to you.
-            </li>
-            <li>
-              <strong>Developer Mode:</strong> A special mode for transit
-              enthusiasts and developers to see raw API data like route and
-              shape IDs.
-            </li>
-          </ul>
-
-          <h4 class="font-semibold">About the Creator:</h4>
-          <p>
-            This app was built by Eddy Zhao (@eddyzow) as a project to provide a
-            useful tool for the Boston community. I hope you enjoy it!
-          </p>
-        </div>
-        <div class="mt-5 sm:mt-6">
-          <button class="modal-close-button">Got it, thanks!</button>
+        <div class="settings-about">
+          Built by Eddy Zhao (<a href="https://eddyzow.net" target="_blank" rel="noopener">@eddyzow</a>) on the official MBTA v3 API.
         </div>
       </div>
     </div>
 
-    <!-- Developer Mode Toggle (fixed position) -->
-    <div id="dev-mode-container">
-      <span class="text-xs font-bold mr-2">Dev Mode</span>
-      <label class="slider-switch">
-        <input type="checkbox" id="dev-mode-toggle" />
-        <span class="slider-thumb"></span>
-      </label>
-    </div>
-
-    <!-- JS Libraries -->
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script
       src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
@@ -233,8 +200,6 @@
       crossorigin=""
     ></script>
     <script src="https://unpkg.com/leaflet-geometryutil@0.10.2/src/leaflet.geometryutil.js"></script>
-
-    <!-- App Script -->
     <script src="script.js"></script>
   </body>
 </html>
