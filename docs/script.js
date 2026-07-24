@@ -344,6 +344,16 @@ document.addEventListener("DOMContentLoaded", function () {
       const pump = () => handleVehicleUpdate(m.vehicles);
       pump();
       setInterval(pump, VEHICLE_UPDATE_MS);
+      // Debug hook (only with ?mock&debug) for verifying interpolation.
+      if (new URLSearchParams(location.search).has("debug")) {
+        window.__mbtaDebug = {
+          push: (vehicles) => handleVehicleUpdate({ vehicles, included: m.vehicles.included }),
+          interpState: () => [...interp.entries()].map(([id, s]) => ({ id, fromDist: s.fromDist, toDist: s.toDist, curDist: s.curDist, deg: s._lastDeg })),
+          raw: m.vehicles,
+          distAlong: (routeId, lat, lng) => distanceAlongRoute(routeId, L.latLng(lat, lng)),
+          posAt: (routeId, d) => positionAtDistance(routeId, d),
+        };
+      }
     }).catch((e) => console.warn("mock load failed", e));
   }
 
@@ -609,14 +619,21 @@ document.addEventListener("DOMContentLoaded", function () {
 
       const ex = interp.get(v.id);
       if (ex && ex.marker) {
-        // Continue from the CURRENT interpolated distance toward the new report,
-        // advancing along the route (double interpolation: elapsed×speed drives it).
-        ex.fromDist = ex.curDist != null ? ex.curDist : ex.toDist;
+        // Start the new leg from where the train is CURRENTLY shown and glide to
+        // the newly reported distance. We only ever interpolate WITHIN
+        // [fromDist, toDist] (see animateVehicles) so the marker never overshoots
+        // and then snaps back — which was flipping the arrow.
+        const fromDist = ex.curDist != null ? ex.curDist : ex.toDist;
+        // Guard against nearest-point ambiguity on folded/branching routes: a
+        // jump larger than a train could plausibly cover in one update (~6 km)
+        // is a snapping artifact, so hard-snap instead of animating a bogus path.
+        const jump = targetDist != null && fromDist != null ? Math.abs(targetDist - fromDist) : 0;
+        if (jump > 6) { ex.fromDist = targetDist; ex.prevDist = targetDist; }
+        else ex.fromDist = fromDist;
         ex.toDist = targetDist;
         ex.start = performance.now(); ex.dur = VEHICLE_UPDATE_MS;
         ex.vehicle = v; ex.routeId = routeId; ex.hasDist = hasDist;
-        ex.kmPerMin = kmPerMin; ex.rawTarget = rawTarget;
-        ex.forward = targetDist != null && ex.fromDist != null ? targetDist >= ex.fromDist : true;
+        ex.kmPerMin = kmPerMin; ex.rawTarget = rawTarget; ex.fromPos = ex.marker.getLatLng();
       } else {
         const marker = L.marker(target, { icon: buildVehicleIcon(v), zIndexOffset: 1000, vehicleData: v });
         updateVehicleTooltip(marker, v, type);
@@ -625,11 +642,11 @@ document.addEventListener("DOMContentLoaded", function () {
         interp.set(v.id, {
           marker, routeId, hasDist, vehicle: v, kmPerMin, rawTarget,
           fromDist: targetDist, toDist: targetDist, curDist: targetDist,
-          start: performance.now(), dur: VEHICLE_UPDATE_MS, forward: true,
-          fromPos: target, toPos: target,
+          start: performance.now(), dur: VEHICLE_UPDATE_MS,
+          fromPos: target, prevDist: targetDist, _lastDeg: null,
         });
-        // initial heading
-        if (hasDist && targetDist != null) marker.setIcon(buildVehicleIcon(v, headingForState(routeId, targetDist, true)));
+        // initial heading from the API bearing until it starts moving
+        if (hasDist && targetDist != null) marker.setIcon(buildVehicleIcon(v, v.attributes.bearing ?? headingForState(routeId, targetDist, true)));
       }
     });
     interp.forEach((st, id) => { if (!seen.has(id)) { if (st.marker) vehicleLayer.removeLayer(st.marker); interp.delete(id); } });
@@ -656,40 +673,51 @@ document.addEventListener("DOMContentLoaded", function () {
     const now = performance.now();
     interp.forEach((st) => {
       if (!st.marker) return;
-      const elapsedMin = (now - st.start) / 60000;
       const t = Math.min(1, (now - st.start) / st.dur);
       if (st.hasDist && st.toDist != null && st.fromDist != null) {
-        // Route-following double interpolation:
-        //  (a) eased blend from the last shown distance to the new reported
-        //      distance (corrects position when a new report arrives), plus
-        //  (b) a dead-reckoning push of elapsed × speed so a moving train keeps
-        //      gliding ALONG the track between identical/late reports instead of
-        //      freezing. Capped so it never overshoots the next report by much.
-        const dir = st.forward === false ? -1 : 1;
-        const moving = st.vehicle.attributes.current_status !== "STOPPED_AT" && st.kmPerMin > 0.01;
-        const eased = st.fromDist + (st.toDist - st.fromDist) * easeInOut(t);
-        let creep = moving ? dir * st.kmPerMin * elapsedMin : 0;
-        // cap creep so we don't drift more than ~1 stop past the report
-        creep = Math.max(-1.2, Math.min(1.2, creep));
-        st.curDist = eased + creep;
-        const pos = positionAtDistance(st.routeId, st.curDist);
-        if (pos) st.marker.setLatLng(pos);
-        // heading along the track
-        const deg = headingForState(st.routeId, st.curDist, st.forward);
-        if (deg != null && Math.abs((st._lastDeg ?? -999) - deg) > 1.5) {
-          st._lastDeg = deg;
-          st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
-          reapplyTooltip(st);
+        // Interpolate ONLY within [fromDist, toDist]. We ease toward the target
+        // and, for a moving train, also let a speed-based glide close the gap
+        // faster — but both are CLAMPED to the target so the marker can never
+        // shoot past and then reverse. This kills the arrow-flip / wrong-way look.
+        const span = st.toDist - st.fromDist;
+        let frac = easeInOut(t);
+        if (Math.abs(span) > 0.001 && st.kmPerMin > 0.01) {
+          // how far speed alone would have carried us this leg, as a fraction
+          const speedFrac = (st.kmPerMin * ((now - st.start) / 60000)) / Math.abs(span);
+          frac = Math.max(frac, Math.min(1, speedFrac));
         }
+        frac = Math.max(0, Math.min(1, frac)); // never leave the segment
+        const newDist = st.fromDist + span * frac;
+
+        // Heading from ACTUAL movement direction this frame (not stale state).
+        const delta = newDist - (st.prevDist ?? newDist);
+        if (Math.abs(delta) > 1e-4) {
+          const forward = delta >= 0;
+          const deg = headingForState(st.routeId, newDist, forward);
+          if (deg != null && (st._lastDeg == null || angleDiff(st._lastDeg, deg) > 4)) {
+            st._lastDeg = deg;
+            st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
+            reapplyTooltip(st);
+          }
+        }
+        st.prevDist = newDist;
+        st.curDist = newDist;
+        const pos = positionAtDistance(st.routeId, newDist);
+        if (pos) st.marker.setLatLng(pos);
       } else {
-        // Fallback straight lerp between raw positions.
+        // Fallback: straight lerp between raw positions (routes without a
+        // distance model), also clamped so it can't overshoot.
         const a = st.fromPos || st.rawTarget, b = st.rawTarget;
         const e = easeInOut(t);
-        st.marker.setLatLng([a[0] + (b[0] - a[0]) * e, a[1] + (b[1] - a[1]) * e]);
+        const lat = (a.lat ?? a[0]) + ((b[0]) - (a.lat ?? a[0])) * e;
+        const lng = (a.lng ?? a[1]) + ((b[1]) - (a.lng ?? a[1])) * e;
+        st.marker.setLatLng([lat, lng]);
       }
     });
     animationFrame = interp.size > 0 ? requestAnimationFrame(animateVehicles) : null;
   };
+  // Smallest absolute difference between two angles in degrees (0..180).
+  const angleDiff = (a, b) => { let d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; };
   const reapplyTooltip = (st) => {
     const { type } = getRouteStyle(st.routeId);
     updateVehicleTooltip(st.marker, st.vehicle, type);
