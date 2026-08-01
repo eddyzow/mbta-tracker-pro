@@ -746,6 +746,11 @@ document.addEventListener("DOMContentLoaded", function () {
 
   const MAX_PREDICT_S = 75;   // cap forward prediction (stale reports don't fling)
   const MAX_EST_SPEED = 30;   // m/s sanity cap (~67 mph)
+  const SEGMENT_TIMES = window.MBTA_SEGMENT_TIMES || {}; // learned median seconds per route|A|B
+
+  // Learned travel seconds for a route segment (either direction), if known.
+  const learnedSegmentSeconds = (routeId, a, b) =>
+    SEGMENT_TIMES[`${routeId}|${a}|${b}`] ?? SEGMENT_TIMES[`${routeId}|${b}|${a}`] ?? null;
 
   // Ingest a report: record its position + timestamp, estimate speed from the
   // change since the previous report, and set up the on-route prediction anchor.
@@ -783,9 +788,15 @@ document.addEventListener("DOMContentLoaded", function () {
               moved = haversine(ex.reportPos, rawTarget) * 1000;
             }
             const inst = moved / dtReport;
-            // smoothed estimate; prefer API speed when present (CR sometimes has it)
+            // Speed sample; prefer API speed when present (CR sometimes has it).
             const sample = speed != null ? speed : inst;
-            estMps = ex.estMps ? ex.estMps * 0.5 + sample * 0.5 : sample;
+            // Average speed over a short history to cancel the ~60m per-report
+            // jitter in raw positions (the raw feed is noisy; averaging the data
+            // we already have is the only route to a truer speed/position).
+            (ex.speedHist = ex.speedHist || []).push(sample);
+            if (ex.speedHist.length > 4) ex.speedHist.shift();
+            const sorted = [...ex.speedHist].sort((a, b) => a - b);
+            estMps = sorted[Math.floor(sorted.length / 2)]; // median of recent samples
           }
           // Decide travel direction along the track.
           let forward = ex.forward !== undefined ? ex.forward : true;
@@ -1035,17 +1046,34 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!c) return;
     if (!res || !res.predictions || !res.predictions.length) { c.innerHTML = `<p class="empty-note">No trip data available.</p>`; return; }
     const seq = v.attributes.current_stop_sequence, inc = res.included;
-    c.innerHTML = res.predictions.map((p) => {
+    const routeId = v.relationships.route.data.id;
+    // Pre-resolve names; then fill any downstream stop lacking a live prediction
+    // with a learned-segment estimate chained from the previous known time.
+    const rows = res.predictions.map((p) => {
       const sid = p.relationships?.stop?.data?.id;
-      const name = inc.get(`stop:${sid}`)?.attributes?.name || stopIdToName.get(sid) || sid || "Stop";
-      const s = p.attributes.stop_sequence;
-      const t = p.attributes.arrival_time || p.attributes.departure_time;
-      const passed = s < seq, current = s === seq;
-      const timeStr = current ? "Here" : passed ? "" : (formatArrivalTime(t) || clockTime(t));
+      return {
+        name: inc.get(`stop:${sid}`)?.attributes?.name || stopIdToName.get(sid) || sid || "Stop",
+        s: p.attributes.stop_sequence,
+        t: p.attributes.arrival_time || p.attributes.departure_time,
+      };
+    });
+    let lastMs = null;
+    rows.forEach((r) => {
+      if (r.t) { lastMs = new Date(r.t).getTime(); r.est = false; }
+      else if (lastMs != null) {
+        const prev = rows[rows.indexOf(r) - 1];
+        const seg = prev ? learnedSegmentSeconds(routeId, prev.name, r.name) : null;
+        if (seg) { lastMs += seg * 1000; r.t = new Date(lastMs).toISOString(); r.est = true; }
+      }
+    });
+    c.innerHTML = rows.map((r) => {
+      const passed = r.s < seq, current = r.s === seq;
+      let timeStr = current ? "Here" : passed ? "" : (formatArrivalTime(r.t) || clockTime(r.t) || "");
+      if (r.est && timeStr) timeStr += "*"; // learned-estimate marker
       return `<div class="trip-stop ${passed ? "passed" : current ? "current" : ""}">
         <div class="dot-col"><span class="t-dot" style="background:${passed ? "#6b6b73" : color}"></span>
         <span class="t-line" style="background:${passed ? "#2a2a30" : color}"></span></div>
-        <span class="t-name">${name}</span><span class="t-time">${timeStr}</span></div>`;
+        <span class="t-name">${r.name}</span><span class="t-time">${timeStr}</span></div>`;
     }).join("");
   };
 
