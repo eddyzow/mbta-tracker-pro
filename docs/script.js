@@ -112,10 +112,6 @@ document.addEventListener("DOMContentLoaded", function () {
   // a station dot wins clicks over the route hit-line where they overlap. A
   // canvas only "hits" where a shape is actually drawn, so empty areas still let
   // route-line clicks through. Vehicles (marker pane, 600) stay on top of both.
-  map.createPane("stationsPane");
-  map.getPane("stationsPane").style.zIndex = 410;
-  const stationRenderer = L.canvas({ pane: "stationsPane", padding: 0.5 });
-
   const vehicleLayer = L.layerGroup().addTo(map);
   const vehicleCtxLayer = L.layerGroup().addTo(map); // prev/next stop highlight
   const stationLayer = L.layerGroup().addTo(map);    // one marker per unique station
@@ -361,6 +357,11 @@ document.addEventListener("DOMContentLoaded", function () {
     vehiclesForRoute(routeId) {
       return this.get("/vehicles", { "filter[route]": routeId, include: "trip,stop", "page[limit]": 120 });
     },
+    allVehicles() {
+      // Every subway + commuter rail + ferry vehicle in one call (for first-load
+      // and as a fallback when the socket is slow/unavailable).
+      return this.get("/vehicles", { "filter[route_type]": "0,1,2,4", include: "trip,stop", "page[limit]": 500 });
+    },
     predictionsForStop(stopId) {
       return this.get("/predictions", { "filter[stop]": stopId, include: "trip,route", "page[limit]": 60, sort: "arrival_time" });
     },
@@ -449,6 +450,8 @@ document.addEventListener("DOMContentLoaded", function () {
           stationPixel: (name) => { const mk = stationMarkers.get(name); if (!mk) return null; const p = map.latLngToContainerPoint(mk.getLatLng()); const r = map.getContainer().getBoundingClientRect(); return { x: Math.round(r.left + p.x), y: Math.round(r.top + p.y) }; },
           stationCount: () => stationMarkers.size,
           routeShapeCounts: () => [...routeAllShapePts.entries()].map(([id, sh]) => ({ id, shapes: sh.length })),
+          hitLineInfo: () => { let n=0,interactive=0,click=0; allRouteLayers.forEach((L2)=>L2.shapes&&L2.shapes.eachLayer((l)=>{ if(l._isHit){n++; if(l.options.interactive!==false)interactive++; if(l._events&&l._events.click)click++;} })); return {n,interactive,click}; },
+          clickLineAt: (name, dyPx) => { const p=map.latLngToContainerPoint(stationMarkers.get(name).getLatLng()); const ll=map.containerPointToLatLng([p.x, p.y+(dyPx||0)]); let hit=null; allRouteLayers.forEach((L2,rid)=>L2.shapes&&L2.shapes.eachLayer((l)=>{ if(l._isHit && L.GeometryUtil){ const d=L.GeometryUtil.distance(map, ll, L.GeometryUtil.closest(map,l,ll)); if(d<20&&!hit)hit=rid; } })); return hit; },
         };
       }
     }).catch((e) => console.warn("mock load failed", e));
@@ -501,6 +504,12 @@ document.addEventListener("DOMContentLoaded", function () {
     if (el.loadingOverlay) el.loadingOverlay.classList.add("hidden");
     requestAnimationFrame(() => map.invalidateSize());
     setTimeout(() => map.invalidateSize(), 300);
+    // Show live trains network-wide immediately, and keep them fresh from the
+    // MBTA API even when the socket feed is slow/unavailable.
+    if (!MOCK_MODE) {
+      refreshAllVehiclesNow();
+      setInterval(() => { if (Date.now() - lastUpdateTime > 18000) refreshAllVehiclesNow(); }, 20000);
+    }
   };
 
   // Connect adjacent stations along each route (ride edges).
@@ -667,20 +676,24 @@ document.addEventListener("DOMContentLoaded", function () {
       // (guards against a stop with no matching shape being flung onto the line).
       const latlng = best && bestDist < 0.25 ? L.latLng(best[0], best[1]) : data.location;
 
-      const marker = L.circleMarker(latlng, {
-        renderer: stationRenderer, // high pane, above route hit-lines -> clickable
-        radius: isTransfer ? 6 : 4.5,
-        fillColor: isTransfer ? "#ffffff" : color,
-        color: isTransfer ? "#111" : "#000",
-        weight: isTransfer ? 2.5 : 1.5,
-        opacity: 0.95, fillOpacity: 1,
+      // DOM divIcon marker (marker pane) instead of a canvas circle: it only
+      // captures clicks on its small dot, so route lines underneath stay fully
+      // clickable, and it renders above the canvas route lines.
+      const r = isTransfer ? 6 : 5;
+      const dot = `<span class="station-dot${isTransfer ? " transfer" : ""}" style="--sc:${color};width:${r * 2}px;height:${r * 2}px"></span>`;
+      const marker = L.marker(latlng, {
+        icon: L.divIcon({ className: "station-div", html: dot, iconSize: [r * 2, r * 2] }),
+        interactive: true,
+        keyboard: false,
+        zIndexOffset: -500, // below vehicles (which use +1000), above lines
       });
       marker._stationName = name;
       marker._baseColor = color;
       marker._isTransfer = isTransfer;
+      marker._radius = r;
       marker.on("click", (e) => { L.DomEvent.stop(e); showStationInfo(name); });
       marker.bindTooltip(isDeveloperMode ? data.id : name, {
-        permanent: isMajor, direction: "top", offset: [0, -6],
+        permanent: isMajor, direction: "top", offset: [0, -r - 2],
         className: isMajor ? "station-name-tooltip" : "station-label-tooltip",
       });
       marker.addTo(stationLayer);
@@ -711,7 +724,17 @@ document.addEventListener("DOMContentLoaded", function () {
      VEHICLES + INTERPOLATION
      ============================================================ */
   const getVehiclesForSelection = () => {
-    let list = selectedRouteId ? allVehicleData.vehicles.filter((v) => v.relationships.route.data.id === selectedRouteId) : [];
+    let list;
+    if (selectedRouteId) {
+      list = allVehicleData.vehicles.filter((v) => v.relationships.route.data.id === selectedRouteId);
+    } else {
+      // Nothing selected → show ALL vehicles whose system is visible, so the map
+      // is alive on first load instead of empty until a route is picked.
+      list = allVehicleData.vehicles.filter((v) => {
+        const t = getRouteType(v.relationships.route.data.id);
+        return qs(`.system-toggle[data-system="${t}"]`)?.checked ?? true;
+      });
+    }
     if (crrcOnly) list = list.filter(isCrrcVehicle);
     return list;
   };
@@ -798,9 +821,10 @@ document.addEventListener("DOMContentLoaded", function () {
             const sorted = [...ex.speedHist].sort((a, b) => a - b);
             estMps = sorted[Math.floor(sorted.length / 2)]; // median of recent samples
           }
-          // Decide travel direction along the track.
+          // Decide travel direction along the track. Only flip direction on a
+          // clear move (>150m) so noise/branch ambiguity can't reverse the train.
           let forward = ex.forward !== undefined ? ex.forward : true;
-          if (hasDist && reportDist != null && ex.reportDist != null && Math.abs(reportDist - ex.reportDist) > 0.03)
+          if (hasDist && reportDist != null && ex.reportDist != null && Math.abs(reportDist - ex.reportDist) > 0.15)
             forward = reportDist >= ex.reportDist;
           ex.reportPos = rawTarget;
           ex.reportTime = reportTime;
@@ -870,40 +894,63 @@ document.addEventListener("DOMContentLoaded", function () {
     return (toD(Math.atan2(y, x)) + 360) % 360;
   };
 
+  // Max rate the DISPLAYED position is allowed to catch up to the target, in km
+  // of along-track distance per second. This is the reconciliation clamp: like
+  // game client-prediction, the marker eases toward the corrected target and
+  // never teleports/snaps — even when a report flips status or jumps.
+  const RECONCILE_KM_PER_S = 0.45; // ~1600 m over ~3.5s worst case
+
+  let lastFrameMs = null;
   const animateVehicles = () => {
     const nowMs = Date.now();
+    const frameDt = lastFrameMs ? Math.min(0.5, (nowMs - lastFrameMs) / 1000) : 0.016;
+    lastFrameMs = nowMs;
+
     interp.forEach((st) => {
       if (!st.marker) return;
-      // FORWARD PREDICTION (dead reckoning): project from the report's own
-      // timestamp so the marker shows where the train IS NOW, not where it was.
-      // elapsed = wall-clock since the report (which is often 20–90s stale).
-      const elapsed = Math.min(MAX_PREDICT_S, Math.max(0, (nowMs - st.reportTime) / 1000));
-      // Speed: estimated from reports (m/s). STOPPED trains decay to ~0 as they
-      // dwell, but we don't hard-freeze (status lags position in the feed).
-      let mps = st.estMps || 0;
-      if (st.status === "STOPPED_AT") mps = Math.min(mps, 1.5) * Math.max(0, 1 - elapsed / 30);
 
-      let pos;
       if (st.hasDist && st.reportDist != null) {
-        let dist = st.reportDist + (st.forward ? 1 : -1) * (mps * elapsed) / 1000; // km
-        // Don't sail through the next station: clamp to it in the travel direction.
+        // 1) TARGET = where the train should be NOW (dead reckon from report).
+        const elapsed = Math.min(MAX_PREDICT_S, Math.max(0, (nowMs - st.reportTime) / 1000));
+        let mps = st.estMps || 0;
+        if (st.status === "STOPPED_AT") mps = Math.min(mps, 1.2) * Math.max(0, 1 - elapsed / 25);
+        let targetDist = st.reportDist + (st.forward ? 1 : -1) * (mps * elapsed) / 1000;
         const ns = nextStopDist(st.routeId, st.reportDist, st.forward);
-        if (ns != null) dist = st.forward ? Math.min(dist, ns) : Math.max(dist, ns);
-        pos = positionAtDistance(st.routeId, dist) || st.reportPos;
-        // Heading along the track in travel direction.
-        const deg = headingForState(st.routeId, dist, st.forward) ?? st.apiBearing;
-        if (deg != null && (st._lastDeg == null || angleDiff(st._lastDeg, deg) > 8)) {
-          st._lastDeg = deg; st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
+        if (ns != null) targetDist = st.forward ? Math.min(targetDist, ns) : Math.max(targetDist, ns);
+
+        // 2) DISPLAY eases toward target, clamped so it can't jump/reverse.
+        if (st.displayDist == null) st.displayDist = targetDist;
+        let delta = targetDist - st.displayDist;
+        const maxStep = RECONCILE_KM_PER_S * frameDt;
+        if (Math.abs(delta) > maxStep) delta = Math.sign(delta) * maxStep;
+        st.displayDist += delta;
+
+        const pos = positionAtDistance(st.routeId, st.displayDist) || st.reportPos;
+        st.marker.setLatLng(pos);
+
+        // Heading from the DISPLAYED motion direction (smooth, never flips wrong).
+        const movingFwd = delta >= 0;
+        // Only update heading when actually moving a meaningful amount this frame.
+        if (Math.abs(delta) > 1e-5) {
+          const deg = headingForState(st.routeId, st.displayDist, movingFwd) ?? st.apiBearing;
+          if (deg != null && (st._lastDeg == null || angleDiff(st._lastDeg, deg) > 10)) {
+            st._lastDeg = deg; st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
+          }
         }
       } else {
-        // No route geometry: project along bearing (straight-line dead reckon).
-        const m = mps * elapsed;
-        const brg = (st.apiBearing ?? 0) * Math.PI / 180;
-        const dLat = (m * Math.cos(brg)) / 111320;
-        const dLng = (m * Math.sin(brg)) / (111320 * Math.cos(st.reportPos[0] * Math.PI / 180));
-        pos = [st.reportPos[0] + dLat, st.reportPos[1] + dLng];
+        // No route geometry: ease raw lat/lng toward the reported point.
+        if (!st.displayPos) st.displayPos = st.reportPos.slice();
+        const target = st.reportPos;
+        const dMeters = haversine(st.displayPos, target);
+        const maxM = RECONCILE_KM_PER_S * 1000 * frameDt;
+        if (dMeters <= maxM || dMeters < 2) st.displayPos = target.slice();
+        else {
+          const f = maxM / dMeters;
+          st.displayPos = [st.displayPos[0] + (target[0] - st.displayPos[0]) * f,
+                           st.displayPos[1] + (target[1] - st.displayPos[1]) * f];
+        }
+        st.marker.setLatLng(st.displayPos);
       }
-      st.marker.setLatLng(pos);
     });
     animationFrame = interp.size > 0 ? requestAnimationFrame(animateVehicles) : null;
   };
@@ -966,6 +1013,7 @@ document.addEventListener("DOMContentLoaded", function () {
     const live = allVehicleData.vehicles.find((x) => x.id === v?.id) || v;
     if (!live) return;
     selectedVehicleId = live.id;
+    _lastTripKey = null; // force trip/delay (re)load for the newly selected train
     refreshVehiclePanelData(live);
     map.flyTo(marker.getLatLng(), Math.max(map.getZoom(), 14));
     plotVehicles(getVehiclesForSelection(), allVehicleData.included);
@@ -1031,15 +1079,23 @@ document.addEventListener("DOMContentLoaded", function () {
       vehicleCtxLayer.clearLayers();
       plotVehicles(getVehiclesForSelection(), allVehicleData.included);
     };
-    computeVehicleDelay(v).then((res) => {
-      if (selectedVehicleId !== v.id) return;
-      const b = getEl("veh-delay-badge");
-      if (b && res && res.delay != null) b.innerHTML = delayBadge(res.delay);
-      renderTripTimeline(v, res, color);
-      drawVehicleContext(v, res);
-      plotVehicles(getVehiclesForSelection(), allVehicleData.included);
-    });
+    // Re-fetch the trip/delay only when first opening or when the vehicle's stop
+    // sequence advanced (a real change) — not on every 20s status refresh, which
+    // would flicker the trip tracker.
+    const tripKey = `${v.id}|${tripId}|${v.attributes.current_stop_sequence}`;
+    if (tripKey !== _lastTripKey) {
+      _lastTripKey = tripKey;
+      computeVehicleDelay(v).then((res) => {
+        if (selectedVehicleId !== v.id) return;
+        const b = getEl("veh-delay-badge");
+        if (b && res && res.delay != null) b.innerHTML = delayBadge(res.delay);
+        renderTripTimeline(v, res, color);
+        drawVehicleContext(v, res);
+        plotVehicles(getVehiclesForSelection(), allVehicleData.included);
+      });
+    }
   };
+  let _lastTripKey = null;
 
   const renderTripTimeline = (v, res, color) => {
     const c = getEl("trip-timeline");
@@ -1562,15 +1618,11 @@ document.addEventListener("DOMContentLoaded", function () {
       const sel = id === selectedRouteId;
       if (layers.shapes) { layers.shapes.eachLayer((l) => { if (l._isVisibleLine) l.setStyle({ weight: sel ? 6 : 3, opacity: sel ? 0.95 : 0.4 }); }); if (sel) layers.shapes.bringToFront(); }
     });
-    // Brighten stations on the selected route; dim the rest.
+    // Brighten stations on the selected route; dim the rest (DOM divIcon opacity).
     const onRoute = new Set(routeStationOrder.get(routeId) || []);
     stationMarkers.forEach((m, name) => {
-      const on = onRoute.has(name);
-      m.setStyle({ radius: on ? (m._isTransfer ? 7 : 5.5) : (m._isTransfer ? 5 : 3.5), opacity: on ? 1 : 0.4, fillOpacity: on ? 1 : 0.4 });
+      if (m.setOpacity) m.setOpacity(onRoute.has(name) ? 1 : 0.35);
     });
-    // Re-assert station dots above the just-fronted route line so they keep
-    // winning clicks on their small hit areas (line stays clickable elsewhere).
-    stationMarkers.forEach((m) => m.bringToFront && m.bringToFront());
 
     const selLayers = allRouteLayers.get(routeId);
     if (showInfo && selLayers?.shapes?.getLayers().length) map.flyToBounds(selLayers.shapes.getBounds().pad(0.1), { animate: true, duration: 0.75 });
@@ -1612,6 +1664,32 @@ document.addEventListener("DOMContentLoaded", function () {
     return [...m.values()];
   };
 
+  // Pull the whole network's live vehicles directly from the MBTA API so trains
+  // are moving from the very first load (before/without the socket feed).
+  let allVehFetchInFlight = false;
+  const refreshAllVehiclesNow = async () => {
+    if (allVehFetchInFlight) return;
+    allVehFetchInFlight = true;
+    try {
+      const data = await mbtaApi.allVehicles();
+      const fresh = data.data || [];
+      if (fresh.length) {
+        allVehicleData = { vehicles: fresh, included: mergeIncluded(allVehicleData.included, data.included || []) };
+        lastUpdateTime = Date.now();
+        if (!MOCK_MODE) setConn("online", "live · direct");
+        const rv = getVehiclesForSelection();
+        plotVehicles(rv, allVehicleData.included);
+        if (selectedRouteId) updateLineInfoVehicleList(selectedRouteId, rv, allVehicleData.included);
+        // Keep an open vehicle panel's status/next-stop current.
+        if (selectedVehicleId && !el.vehicleInfo.classList.contains("hidden")) {
+          const v = allVehicleData.vehicles.find((x) => x.id === selectedVehicleId);
+          if (v) refreshVehiclePanelData(v);
+        }
+      }
+    } catch (e) { /* rate limited/offline — socket feed still applies */ }
+    finally { allVehFetchInFlight = false; }
+  };
+
   const deselectAll = (soft = false) => {
     lastClickedShapeId = null;
     if (!soft || isDeveloperMode) qsa(".info-overlay").forEach((p) => p.classList.add("hidden"));
@@ -1622,8 +1700,8 @@ document.addEventListener("DOMContentLoaded", function () {
     allRouteLayers.forEach((layers) => {
       if (layers.shapes) layers.shapes.eachLayer((l) => { if (l._isVisibleLine) l.setStyle({ weight: 3, opacity: 0.4 }); });
     });
-    // Reset all stations to their default look.
-    stationMarkers.forEach((m) => m.setStyle({ radius: m._isTransfer ? 6 : 4.5, opacity: 0.95, fillOpacity: 1 }));
+    // Reset all stations to full opacity.
+    stationMarkers.forEach((m) => m.setOpacity && m.setOpacity(1));
     setLineVisibility();
   };
 
