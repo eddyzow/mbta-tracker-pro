@@ -884,6 +884,10 @@ document.addEventListener("DOMContentLoaded", function () {
           ex.forward = forward;
           ex.status = current_status;
           ex.apiBearing = bearing;
+          // Refresh the hover tooltip so its status/next-stop/destination update
+          // live, and keep the marker's stored vehicle current for click/details.
+          ex.marker.options.vehicleData = v;
+          updateVehicleTooltip(ex.marker, v, type);
         }
         ex.vehicle = v; ex.routeId = routeId; ex.hasDist = hasDist;
       } else {
@@ -1113,45 +1117,64 @@ document.addEventListener("DOMContentLoaded", function () {
     });
   };
 
-  const refreshVehiclePanelData = (v) => {
-    const lookup = new Map(allVehicleData.included?.map((i) => [i.id, i]));
-    const { label, current_status, updated_at, speed } = v.attributes;
+  // Rebuild the panel SHELL once (on select / when the tracked train changes),
+  // then only update the dynamic field values on subsequent refreshes — so the
+  // trip-timeline div is NOT wiped back to "Loading trip…" on every update.
+  const buildVehiclePanelShell = (v) => {
     const routeId = v.relationships.route.data.id;
     const { color } = getRouteStyle(routeId);
     const crrc = isCrrcVehicle(v);
-    const tripId = v.relationships.trip?.data?.id;
-    const stopId = v.relationships.stop?.data?.id;
-    const nextStop = stopIdToName.get(stopId) || lookup.get(stopId)?.attributes?.name || "N/A";
-    const trip = lookup.get(tripId);
-    const headsign = trip?.attributes?.headsign;
-    const cars = (v.attributes.carriages || []).map((c) => c.label).filter(Boolean);
-    const occ = (v.attributes.carriages || []).map((c) => c.occupancy_status).filter(Boolean);
-    const occTxt = occ.length ? occ[0].replace(/_/g, " ").toLowerCase() : null;
-
+    const label = v.attributes.label;
     el.vehicleInfo.innerHTML = `
       <button class="close-button">&times;</button>
       <h4 class="info-header" style="color:${color}">${isDeveloperMode ? v.id : `Train ${label || "—"}`}
         ${crrc ? '<span class="badge new">New CRRC</span>' : ""}<span id="veh-delay-badge"></span></h4>
-      <div class="info-subheader">${routeLongName(routeId)}${headsign ? " → " + headsign : ""}</div>
+      <div class="info-subheader" id="veh-sub"></div>
       <div class="info-content">
-        <div class="info-row"><span class="info-label">Status</span><span class="info-value" style="text-transform:capitalize">${(current_status || "").replace(/_/g, " ").toLowerCase()}</span></div>
-        <div class="info-row"><span class="info-label">Next stop</span><span class="info-value">${nextStop}</span></div>
-        ${speed != null ? `<div class="info-row"><span class="info-label">Speed</span><span class="info-value">${Math.round(speed * 2.237)} mph</span></div>` : ""}
-        ${cars.length ? `<div class="info-row"><span class="info-label">Cars</span><span class="info-value">${cars.join(", ")}</span></div>` : ""}
-        ${occTxt ? `<div class="info-row"><span class="info-label">Occupancy</span><span class="info-value" style="text-transform:capitalize">${occTxt}</span></div>` : ""}
-        <div class="info-row"><span class="info-label">Updated</span><span class="info-value">${formatRelativeTime(updated_at)}</span></div>
+        <div class="info-row"><span class="info-label">Status</span><span class="info-value" id="veh-status" style="text-transform:capitalize"></span></div>
+        <div class="info-row"><span class="info-label">Next stop</span><span class="info-value" id="veh-next"></span></div>
+        <div class="info-row" id="veh-speed-row" style="display:none"><span class="info-label">Speed</span><span class="info-value" id="veh-speed"></span></div>
+        <div class="info-row" id="veh-cars-row" style="display:none"><span class="info-label">Cars</span><span class="info-value" id="veh-cars"></span></div>
+        <div class="info-row" id="veh-occ-row" style="display:none"><span class="info-label">Occupancy</span><span class="info-value" id="veh-occ" style="text-transform:capitalize"></span></div>
+        <div class="info-row"><span class="info-label">Updated</span><span class="info-value" id="veh-updated"></span></div>
       </div>
       <div class="section-title">Trip tracker</div>
       <div id="trip-timeline" class="trip-timeline"><p class="empty-note">Loading trip…</p></div>`;
     el.vehicleInfo.classList.remove("hidden");
     el.vehicleInfo.querySelector(".close-button").onclick = () => {
-      selectedVehicleId = null; el.vehicleInfo.classList.add("hidden");
+      selectedVehicleId = null; _shellVehicleId = null; el.vehicleInfo.classList.add("hidden");
       vehicleCtxLayer.clearLayers();
       plotVehicles(getVehiclesForSelection(), allVehicleData.included);
     };
-    // Re-fetch the trip/delay only when first opening or when the vehicle's stop
-    // sequence advanced (a real change) — not on every 20s status refresh, which
-    // would flicker the trip tracker.
+  };
+
+  const refreshVehiclePanelData = (v) => {
+    // (Re)build the shell only when the selected train changed.
+    if (_shellVehicleId !== v.id) { _shellVehicleId = v.id; buildVehiclePanelShell(v); }
+
+    const lookup = new Map(allVehicleData.included?.map((i) => [i.id, i]));
+    const { current_status, updated_at, speed } = v.attributes;
+    const routeId = v.relationships.route.data.id;
+    const { color } = getRouteStyle(routeId);
+    const tripId = v.relationships.trip?.data?.id;
+    const stopId = v.relationships.stop?.data?.id;
+    const nextStop = stopIdToName.get(stopId) || lookup.get(stopId)?.attributes?.name || "N/A";
+    const headsign = lookup.get(tripId)?.attributes?.headsign;
+    const cars = (v.attributes.carriages || []).map((c) => c.label).filter(Boolean);
+    const occ = (v.attributes.carriages || []).map((c) => c.occupancy_status).filter(Boolean);
+    const occTxt = occ.length ? occ[0].replace(/_/g, " ").toLowerCase() : null;
+    const set = (id, txt) => { const e = getEl(id); if (e) e.textContent = txt; };
+
+    // Update only the dynamic fields in place (never touches #trip-timeline).
+    set("veh-sub", routeLongName(routeId) + (headsign ? " → " + headsign : ""));
+    set("veh-status", (current_status || "").replace(/_/g, " ").toLowerCase());
+    set("veh-next", nextStop);
+    set("veh-updated", formatRelativeTime(updated_at));
+    if (speed != null) { getEl("veh-speed-row").style.display = ""; set("veh-speed", Math.round(speed * 2.237) + " mph"); }
+    if (cars.length) { getEl("veh-cars-row").style.display = ""; set("veh-cars", cars.join(", ")); }
+    if (occTxt) { getEl("veh-occ-row").style.display = ""; set("veh-occ", occTxt); }
+
+    // Re-fetch the trip/delay only when the stop sequence advanced (a real change).
     const tripKey = `${v.id}|${tripId}|${v.attributes.current_stop_sequence}`;
     if (tripKey !== _lastTripKey) {
       _lastTripKey = tripKey;
@@ -1159,21 +1182,19 @@ document.addEventListener("DOMContentLoaded", function () {
         if (selectedVehicleId !== v.id) return;
         const b = getEl("veh-delay-badge");
         if (b && res && res.delay != null) b.innerHTML = delayBadge(res.delay);
-        renderTripTimeline(v, res, color);
+        renderTripTimeline(v, res, color); // renders data OR "No trip data available"
         drawVehicleContext(v, res);
-        plotVehicles(getVehiclesForSelection(), allVehicleData.included);
       }).catch(() => {
-        // On failure (rate limit / network) don't hang on "Loading trip…":
-        // show a message and clear the key so the next refresh retries.
         if (selectedVehicleId === v.id) {
           const c = getEl("trip-timeline");
           if (c) c.innerHTML = `<p class="empty-note">Trip data unavailable — retrying…</p>`;
         }
-        _lastTripKey = null;
+        _lastTripKey = null; // allow retry next refresh
       });
     }
   };
   let _lastTripKey = null;
+  let _shellVehicleId = null;
 
   const renderTripTimeline = (v, res, color) => {
     const c = getEl("trip-timeline");
