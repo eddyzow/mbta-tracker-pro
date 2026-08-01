@@ -5,7 +5,11 @@ document.addEventListener("DOMContentLoaded", function () {
      CONFIG & STATE
      ============================================================ */
   const MBTA_API = "https://api-v3.mbta.com";
-  const VEHICLE_UPDATE_MS = 30000;
+  // The Heroku server pushes vehicle updates about every 20s; interpolation
+  // glides each train over this window. `measuredUpdateMs` adapts to the real
+  // gap between pushes so timing self-corrects if the server rate changes.
+  const VEHICLE_UPDATE_MS = 20000;
+  let measuredUpdateMs = VEHICLE_UPDATE_MS;
   const ALERTS_REFRESH_MS = 60000;
 
   let routeDataCache = null;
@@ -70,6 +74,7 @@ document.addEventListener("DOMContentLoaded", function () {
   const stopIdToName = new Map();         // stopId (child or parent) -> station name
   const allRouteLayers = new Map();
   const routePolylinePts = new Map();
+  const routeAllShapePts = new Map(); // routeId -> [ [ [lat,lng], ... ], ... ] all kept shapes (for station snapping across branches)
   const journeyLayer = L.layerGroup();
 
   /* ============================================================
@@ -103,8 +108,18 @@ document.addEventListener("DOMContentLoaded", function () {
     maxZoom: 20, subdomains: "abcd", pane: "shadowPane", opacity: 0.9,
   }).addTo(map);
 
+  // Stations get their own pane/canvas just above the route pane (410 vs 400) so
+  // a station dot wins clicks over the route hit-line where they overlap. A
+  // canvas only "hits" where a shape is actually drawn, so empty areas still let
+  // route-line clicks through. Vehicles (marker pane, 600) stay on top of both.
+  map.createPane("stationsPane");
+  map.getPane("stationsPane").style.zIndex = 410;
+  const stationRenderer = L.canvas({ pane: "stationsPane", padding: 0.5 });
+
   const vehicleLayer = L.layerGroup().addTo(map);
   const vehicleCtxLayer = L.layerGroup().addTo(map); // prev/next stop highlight
+  const stationLayer = L.layerGroup().addTo(map);    // one marker per unique station
+  const stationMarkers = new Map();                  // name -> marker (for restyle)
   journeyLayer.addTo(map);
 
   /* ============================================================
@@ -208,6 +223,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // advance ALONG the tracks by (speed × elapsed), instead of a straight lerp
   // that cuts across corners.
   const routeCumDist = new Map(); // routeId -> { pts:[[lat,lng]], cum:[km] }
+  const routeStopDists = new Map(); // routeId -> sorted [km] of stop positions along the line
 
   const buildRouteDistances = (routeId, pts) => {
     if (!pts || pts.length < 2) return;
@@ -216,17 +232,48 @@ document.addEventListener("DOMContentLoaded", function () {
     routeCumDist.set(routeId, { pts, cum });
   };
 
-  // Nearest distance-along-route (km) to a given latlng.
-  const distanceAlongRoute = (routeId, latlng) => {
+  // Precompute where each stop falls along the route line, so a predicted train
+  // can be clamped to the NEXT stop instead of sailing through it.
+  const buildRouteStopDists = (routeId, stops) => {
+    if (!routeCumDist.has(routeId) || !stops) return;
+    const ds = [];
+    const seen = new Set();
+    stops.forEach((s) => {
+      const { name, latitude, longitude } = s.attributes;
+      if (seen.has(name) || latitude == null) return;
+      seen.add(name);
+      const d = distanceAlongRoute(routeId, [latitude, longitude]);
+      if (d != null) ds.push(d);
+    });
+    ds.sort((a, b) => a - b);
+    routeStopDists.set(routeId, ds);
+  };
+  // Smallest stop distance strictly greater than `dist` in the travel direction.
+  const nextStopDist = (routeId, dist, forward) => {
+    const ds = routeStopDists.get(routeId);
+    if (!ds || !ds.length) return null;
+    if (forward) { for (const d of ds) if (d > dist + 0.02) return d; return null; }
+    for (let i = ds.length - 1; i >= 0; i--) if (ds[i] < dist - 0.02) return ds[i];
+    return null;
+  };
+
+  // Nearest distance-along-route (km) to a given latlng. When `hintKm` is given,
+  // prefer a candidate near that distance so a train doesn't jump to a far,
+  // equidistant part of an overlapping/looping track (which flipped headings).
+  const distanceAlongRoute = (routeId, latlng, hintKm) => {
     const rd = routeCumDist.get(routeId);
     if (!rd) return null;
     const { pts, cum } = rd;
     const p = [latlng.lat ?? latlng[0], latlng.lng ?? latlng[1]];
-    let best = 0, bestDist = Infinity;
+    let best = 0, bestScore = Infinity;
     for (let i = 0; i < pts.length - 1; i++) {
       const proj = projectOnSegment(p, pts[i], pts[i + 1]);
       const d = haversine(p, proj.point);
-      if (d < bestDist) { bestDist = d; best = cum[i] + haversine(pts[i], proj.point); }
+      const along = cum[i] + haversine(pts[i], proj.point);
+      // score = perpendicular distance, plus a small penalty for being far from
+      // the hint so near-ties resolve to continuity rather than a distant match.
+      const score = hintKm != null ? d + Math.min(0.5, Math.abs(along - hintKm) * 0.05) : d;
+      if (score < bestScore) { bestScore = score; best = along; }
     }
     return best;
   };
@@ -256,6 +303,33 @@ document.addEventListener("DOMContentLoaded", function () {
     let t = ((px - ax) * dx + (py - ay) * dy) / len2;
     t = Math.max(0, Math.min(1, t));
     return { point: [ay + dy * t, ax + dx * t], t };
+  };
+
+  // Min distance (km) from point p to polyline pts.
+  const distToPolyline = (p, pts) => {
+    let best = Infinity;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const d = haversine(p, projectOnSegment(p, pts[i], pts[i + 1]).point);
+      if (d < best) best = d;
+    }
+    return best;
+  };
+  const polyKm = (pts) => { let k = 0; for (let i = 1; i < pts.length; i++) k += haversine(pts[i - 1], pts[i]); return k; };
+  // True only if shape A is essentially the SAME line as B (a redundant
+  // duplicate), not merely sharing a trunk. Requires both: ~all of A lies on B,
+  // AND A isn't much longer than B (a longer branch that happens to overlap the
+  // trunk is NOT a duplicate and must be kept).
+  const shapesOverlap = (aPts, bPts) => {
+    if (aPts.length < 2 || bPts.length < 2) return false;
+    const aKm = polyKm(aPts), bKm = polyKm(bPts);
+    if (aKm > bKm * 1.15) return false; // A extends meaningfully beyond B -> distinct branch
+    const step = Math.max(1, Math.floor(aPts.length / 30));
+    let near = 0, total = 0;
+    for (let i = 0; i < aPts.length; i += step) {
+      total++;
+      if (distToPolyline(aPts[i], bPts) < 0.03) near++;
+    }
+    return total > 0 && near / total > 0.9;
   };
 
   // Bearing (deg from north, clockwise) of the route at a given distance —
@@ -318,14 +392,21 @@ document.addEventListener("DOMContentLoaded", function () {
     : io(SOCKET_URL, { transports: ["websocket", "polling"] });
 
   socket.on("connect", () => { setConn("online", "live"); startUpdateTimer(); socket.emit("request-initial-data"); });
-  socket.on("disconnect", () => { setConn("offline", "offline"); if (updateTimerInterval) clearInterval(updateTimerInterval); el.updatePill.textContent = "Offline"; });
-  socket.on("connect_error", () => setConn("offline", "connection error"));
+  socket.on("reconnect", () => { setConn("online", "live"); socket.emit("request-initial-data"); });
+  socket.on("disconnect", () => { setConn("offline", "reconnecting…"); el.updatePill.textContent = "Reconnecting…"; });
+  socket.on("connect_error", () => setConn("offline", "reconnecting…"));
   socket.on("mbta-route-data", (d) => processRouteData(d));
   socket.on("mbta-vehicle-update", (d) => handleVehicleUpdate(d));
 
   const handleVehicleUpdate = (data) => {
     allVehicleData = data;
-    lastUpdateTime = Date.now();
+    // Measure the real gap between server pushes and smooth it, so interpolation
+    // glides trains over the actual update interval (~20s) rather than a guess.
+    const now = Date.now();
+    const gap = now - lastUpdateTime;
+    if (gap > 3000 && gap < 90000) measuredUpdateMs = Math.round(measuredUpdateMs * 0.7 + gap * 0.3);
+    lastUpdateTime = now;
+    if (!MOCK_MODE) setConn("online", "live");
     const plot = getVehiclesForSelection();
     plotVehicles(plot, allVehicleData.included);
     if (selectedRouteId) updateLineInfoVehicleList(selectedRouteId, plot, allVehicleData.included);
@@ -334,6 +415,18 @@ document.addEventListener("DOMContentLoaded", function () {
       if (v) refreshVehiclePanelData(v);
     }
   };
+
+  // Safety net: if the socket feed goes quiet (dyno idle, dropped push) while a
+  // route is selected, pull fresh vehicles straight from the MBTA API so trains
+  // keep updating without a page reload.
+  if (!MOCK_MODE) {
+    setInterval(() => {
+      const stale = Date.now() - lastUpdateTime > 45000;
+      if (stale && selectedRouteId) refreshRouteVehiclesNow(selectedRouteId);
+      // keep the animation loop alive regardless
+      startAnimation();
+    }, 15000);
+  }
 
   // Mock replay
   if (MOCK_MODE) {
@@ -352,6 +445,10 @@ document.addEventListener("DOMContentLoaded", function () {
           raw: m.vehicles,
           distAlong: (routeId, lat, lng) => distanceAlongRoute(routeId, L.latLng(lat, lng)),
           posAt: (routeId, d) => positionAtDistance(routeId, d),
+          clickStation: (name) => { const mk = stationMarkers.get(name); if (mk) mk.fire("click", { originalEvent: new MouseEvent("click") }); return !!mk; },
+          stationPixel: (name) => { const mk = stationMarkers.get(name); if (!mk) return null; const p = map.latLngToContainerPoint(mk.getLatLng()); const r = map.getContainer().getBoundingClientRect(); return { x: Math.round(r.left + p.x), y: Math.round(r.top + p.y) }; },
+          stationCount: () => stationMarkers.size,
+          routeShapeCounts: () => [...routeAllShapePts.entries()].map(([id, sh]) => ({ id, shapes: sh.length })),
         };
       }
     }).catch((e) => console.warn("mock load failed", e));
@@ -396,6 +493,7 @@ document.addEventListener("DOMContentLoaded", function () {
     });
 
     buildGraphEdges();
+    drawAllStations();
     displayList("Subway");
     populatePlanner();
     loadAlerts();
@@ -493,9 +591,7 @@ document.addEventListener("DOMContentLoaded", function () {
     const style = { color, weight: isInactive ? 3 : 6, opacity: isInactive ? 0.4 : 0.95, lineCap: "round", lineJoin: "round" };
     if (!stops || !shapes || !shapes.length) return;
 
-    // Pick the real GEOGRAPHIC rail shapes and drop the "straight line between
-    // stations" generated shapes. Prefer canonical; among those, keep only
-    // shapes with high point-density (the generated connectors are sparse).
+    // Decode all shapes with geometry stats.
     const decoded = shapes
       .filter((s) => s && s.attributes.polyline)
       .map((s) => {
@@ -506,22 +602,27 @@ document.addEventListener("DOMContentLoaded", function () {
       })
       .filter((s) => s.pts.length >= 2);
 
+    // Prefer canonical shapes (the MBTA's representative geographic geometry).
+    // NEVER let a route end up with zero shapes.
     let finalShapes = decoded.filter((s) => s.canonical);
     if (!finalShapes.length) finalShapes = decoded;
-    // Geographic rail has many points per km; station-connector lines are sparse.
-    // Keep shapes at/above 60% of the densest shape's density (min 8 pts/km).
-    const maxDensity = Math.max(...finalShapes.map((s) => s.density), 0);
-    if (maxDensity > 0) {
-      const threshold = Math.max(8, maxDensity * 0.6);
-      const dense = finalShapes.filter((s) => s.density >= threshold);
-      if (dense.length) finalShapes = dense;
-    }
+
+    // Drop only NEAR-IDENTICAL duplicates (e.g. an inbound shape that retraces an
+    // outbound one) so a route isn't drawn as a doubled line — but keep genuinely
+    // different branches. Longest first so branches survive; always keep at least
+    // one shape.
+    finalShapes.sort((a, b) => b.km - a.km);
+    const kept = [];
+    finalShapes.forEach((s) => {
+      if (!kept.some((k) => shapesOverlap(s.pts, k.pts))) kept.push(s);
+    });
+    finalShapes = kept.length ? kept : [finalShapes[0]];
 
     let longest = null, longestLen = -1;
     finalShapes.forEach((shape) => {
       const pts = shape.pts;
       if (pts.length > longestLen) { longestLen = pts.length; longest = pts; }
-      const hit = L.polyline(pts, { color, weight: 16, opacity: 0, lineCap: "round" });
+      const hit = L.polyline(pts, { color, weight: 12, opacity: 0, lineCap: "round" });
       hit.on("click", (e) => { L.DomEvent.stop(e); lastClickedShapeId = shape.id; selectRoute(routeId); });
       hit.bindTooltip(isDeveloperMode ? `${routeId} / ${shape.id}` : routeLongName(routeId), { className: "line-label-tooltip", sticky: true });
       hit._isHit = true;
@@ -530,33 +631,61 @@ document.addEventListener("DOMContentLoaded", function () {
       pl._isVisibleLine = true;
       layerGroup.shapes.addLayer(pl);
     });
-    if (longest) { routePolylinePts.set(routeId, longest); buildRouteDistances(routeId, longest); }
+    if (longest) { routePolylinePts.set(routeId, longest); buildRouteDistances(routeId, longest); buildRouteStopDists(routeId, stops); }
+    routeAllShapePts.set(routeId, finalShapes.map((s) => s.pts));
+    // Stations are drawn once, globally, by drawAllStations() — not per route —
+    // so transfer stations aren't stacked/duplicated.
+  };
 
-    const drawn = new Set();
-    stops.forEach((stop) => {
-      const { name, latitude, longitude } = stop.attributes;
-      if (drawn.has(name) || !latitude || !longitude) return;
-      const servicing = stationToRoutesMap.get(name);
-      const isTransfer = servicing && servicing.routes.size > 1;
+  // Draw exactly one marker per unique station, snapped onto its route line.
+  const drawAllStations = () => {
+    stationLayer.clearLayers();
+    stationMarkers.clear();
+    stationToRoutesMap.forEach((data, name) => {
+      const routes = [...data.routes];
+      // primary route = the one whose color/label we use, prefer non-CR subway
+      const primary = routes.find((r) => !r.startsWith("CR-") && !r.startsWith("Boat-")) || routes[0];
+      const { color } = getRouteStyle(primary);
+      const isTransfer = data.routes.size > 1;
       const isMajor = majorStations.has(name);
 
-      const marker = L.circleMarker([latitude, longitude], {
-        radius: isInactive ? (isTransfer ? 4 : 3) : isTransfer ? 6.5 : 5,
-        fillColor: isTransfer ? "#ffffff" : color,
-        color: isTransfer ? color : "#000",
-        weight: isTransfer ? 2.5 : 1.5,
-        opacity: style.opacity, fillOpacity: isTransfer ? 1 : style.opacity,
+      // Snap the station to the nearest point across ALL of its routes' shapes
+      // (so branch stops, e.g. Red's Ashmont vs Braintree legs, snap correctly
+      // rather than to a single trunk shape).
+      const raw = [data.location.lat, data.location.lng];
+      let best = null, bestDist = Infinity;
+      routes.forEach((rId) => {
+        (routeAllShapePts.get(rId) || []).forEach((pts) => {
+          for (let i = 0; i < pts.length - 1; i++) {
+            const proj = projectOnSegment(raw, pts[i], pts[i + 1]).point;
+            const d = haversine(raw, proj);
+            if (d < bestDist) { bestDist = d; best = proj; }
+          }
+        });
       });
+      // Only accept the snap if it's within 250 m; otherwise keep raw location
+      // (guards against a stop with no matching shape being flung onto the line).
+      const latlng = best && bestDist < 0.25 ? L.latLng(best[0], best[1]) : data.location;
+
+      const marker = L.circleMarker(latlng, {
+        renderer: stationRenderer, // high pane, above route hit-lines -> clickable
+        radius: isTransfer ? 6 : 4.5,
+        fillColor: isTransfer ? "#ffffff" : color,
+        color: isTransfer ? "#111" : "#000",
+        weight: isTransfer ? 2.5 : 1.5,
+        opacity: 0.95, fillOpacity: 1,
+      });
+      marker._stationName = name;
+      marker._baseColor = color;
+      marker._isTransfer = isTransfer;
       marker.on("click", (e) => { L.DomEvent.stop(e); showStationInfo(name); });
-      if (isMajor) {
-        marker.bindTooltip(isDeveloperMode ? stop.id : name, { permanent: true, direction: "top", offset: [0, -6], className: "station-name-tooltip" });
-      } else {
-        marker.bindTooltip(isDeveloperMode ? stop.id : name, { direction: "top", offset: [0, -5], className: "station-label-tooltip" });
-      }
-      marker.addTo(layerGroup.stops);
-      drawn.add(name);
+      marker.bindTooltip(isDeveloperMode ? data.id : name, {
+        permanent: isMajor, direction: "top", offset: [0, -6],
+        className: isMajor ? "station-name-tooltip" : "station-label-tooltip",
+      });
+      marker.addTo(stationLayer);
+      stationMarkers.set(name, marker);
     });
-    if (routeId === selectedRouteId) layerGroup.stops.bringToFront();
   };
 
   const setLineVisibility = () => {
@@ -565,6 +694,16 @@ document.addEventListener("DOMContentLoaded", function () {
       const sysVisible = qs(`.system-toggle[data-system="${type}"]`)?.checked ?? true;
       const visible = sysVisible && (showAllLines || routeId === selectedRouteId);
       Object.values(layers).forEach((lg) => (visible ? map.addLayer(lg) : map.removeLayer(lg)));
+    });
+    // Show a station if any of its routes' systems is currently visible (and, when
+    // not showing all lines, only stations on the selected route).
+    stationMarkers.forEach((m, name) => {
+      const routes = [...(stationToRoutesMap.get(name)?.routes || [])];
+      const anySysVisible = routes.some((r) => qs(`.system-toggle[data-system="${getRouteStyle(r).type}"]`)?.checked ?? true);
+      const onSelected = !selectedRouteId || (routeStationOrder.get(selectedRouteId) || []).includes(name);
+      const visible = anySysVisible && (showAllLines || onSelected);
+      if (visible) { if (!stationLayer.hasLayer(m)) m.addTo(stationLayer); }
+      else stationLayer.removeLayer(m);
     });
   };
 
@@ -600,129 +739,192 @@ document.addEventListener("DOMContentLoaded", function () {
     return deg;
   };
 
+  // Max realistic ground distance (km) a vehicle covers between two ~30s reports.
+  // A jump bigger than this is a bad/duplicate report or a branch-id switch — we
+  // SNAP to it instead of animating a "race across the map".
+  const MAX_LEG_KM = 1.6; // ~55 mph over 30s + margin
+
+  const MAX_PREDICT_S = 75;   // cap forward prediction (stale reports don't fling)
+  const MAX_EST_SPEED = 30;   // m/s sanity cap (~67 mph)
+  const SEGMENT_TIMES = window.MBTA_SEGMENT_TIMES || {}; // learned median seconds per route|A|B
+
+  // Learned travel seconds for a route segment (either direction), if known.
+  const learnedSegmentSeconds = (routeId, a, b) =>
+    SEGMENT_TIMES[`${routeId}|${a}|${b}`] ?? SEGMENT_TIMES[`${routeId}|${b}|${a}`] ?? null;
+
+  // Ingest a report: record its position + timestamp, estimate speed from the
+  // change since the previous report, and set up the on-route prediction anchor.
   const plotVehicles = (vehicles, included) => {
     if (!vehicles) vehicles = [];
     const seen = new Set();
     vehicles.forEach((v) => {
-      const { latitude, longitude, speed } = v.attributes;
+      const { latitude, longitude, bearing, current_status, updated_at, speed } = v.attributes;
       if (latitude == null || longitude == null) return;
       const routeId = v.relationships.route.data.id;
       const { type } = getRouteStyle(routeId);
       seen.add(v.id);
 
-      const hasDist = routeCumDist.has(routeId);
-      const targetDist = hasDist ? distanceAlongRoute(routeId, L.latLng(latitude, longitude)) : null;
       const rawTarget = [latitude, longitude];
-      const target = hasDist && targetDist != null ? positionAtDistance(routeId, targetDist) : rawTarget;
-      // speed: m/s -> km/min
-      const kmPerMin = speed != null ? (speed * 60) / 1000 : type === "Commuter Rail" ? 1.1 : 0.6;
-
+      const reportTime = updated_at ? new Date(updated_at).getTime() : Date.now();
+      const hasDist = routeCumDist.has(routeId);
       const ex = interp.get(v.id);
+      const prevDistHint = ex ? (ex.reportDist != null ? ex.reportDist : null) : null;
+      const reportDist = hasDist ? distanceAlongRoute(routeId, rawTarget, prevDistHint) : null;
+
       if (ex && ex.marker) {
-        // Start the new leg from where the train is CURRENTLY shown and glide to
-        // the newly reported distance. We only ever interpolate WITHIN
-        // [fromDist, toDist] (see animateVehicles) so the marker never overshoots
-        // and then snaps back — which was flipping the arrow.
-        const fromDist = ex.curDist != null ? ex.curDist : ex.toDist;
-        // Guard against nearest-point ambiguity on folded/branching routes: a
-        // jump larger than a train could plausibly cover in one update (~6 km)
-        // is a snapping artifact, so hard-snap instead of animating a bogus path.
-        const jump = targetDist != null && fromDist != null ? Math.abs(targetDist - fromDist) : 0;
-        if (jump > 6) { ex.fromDist = targetDist; ex.prevDist = targetDist; }
-        else ex.fromDist = fromDist;
-        ex.toDist = targetDist;
-        ex.start = performance.now(); ex.dur = VEHICLE_UPDATE_MS;
+        // Only treat as a NEW report when updated_at actually advanced.
+        const isNewReport = reportTime !== ex.reportTime;
+        if (isNewReport) {
+          // Estimate speed (m/s) from along-track movement since last report.
+          const dtReport = (reportTime - ex.reportTime) / 1000;
+          let estMps = ex.estMps || 0;
+          if (dtReport > 2 && dtReport < 240) {
+            let moved;
+            if (hasDist && reportDist != null && ex.reportDist != null) {
+              moved = Math.abs(reportDist - ex.reportDist) * 1000; // km->m
+              // guard route-ambiguity jumps: fall back to straight-line
+              if (moved > MAX_LEG_KM * 1000) moved = haversine([...(ex.reportPos)], rawTarget) * 1000;
+            } else {
+              moved = haversine(ex.reportPos, rawTarget) * 1000;
+            }
+            const inst = moved / dtReport;
+            // Speed sample; prefer API speed when present (CR sometimes has it).
+            const sample = speed != null ? speed : inst;
+            // Average speed over a short history to cancel the ~60m per-report
+            // jitter in raw positions (the raw feed is noisy; averaging the data
+            // we already have is the only route to a truer speed/position).
+            (ex.speedHist = ex.speedHist || []).push(sample);
+            if (ex.speedHist.length > 4) ex.speedHist.shift();
+            const sorted = [...ex.speedHist].sort((a, b) => a - b);
+            estMps = sorted[Math.floor(sorted.length / 2)]; // median of recent samples
+          }
+          // Decide travel direction along the track.
+          let forward = ex.forward !== undefined ? ex.forward : true;
+          if (hasDist && reportDist != null && ex.reportDist != null && Math.abs(reportDist - ex.reportDist) > 0.03)
+            forward = reportDist >= ex.reportDist;
+          ex.reportPos = rawTarget;
+          ex.reportTime = reportTime;
+          ex.reportDist = reportDist;
+          ex.estMps = Math.max(0, Math.min(MAX_EST_SPEED, estMps));
+          ex.forward = forward;
+          ex.status = current_status;
+          ex.apiBearing = bearing;
+        }
         ex.vehicle = v; ex.routeId = routeId; ex.hasDist = hasDist;
-        ex.kmPerMin = kmPerMin; ex.rawTarget = rawTarget; ex.fromPos = ex.marker.getLatLng();
       } else {
-        const marker = L.marker(target, { icon: buildVehicleIcon(v), zIndexOffset: 1000, vehicleData: v });
+        const marker = L.marker(rawTarget, { icon: buildVehicleIcon(v, bearing), zIndexOffset: 1000, vehicleData: v });
         updateVehicleTooltip(marker, v, type);
         marker.on("click", (e) => { L.DomEvent.stop(e); displayVehicleDetails(marker); });
         marker.addTo(vehicleLayer);
         interp.set(v.id, {
-          marker, routeId, hasDist, vehicle: v, kmPerMin, rawTarget,
-          fromDist: targetDist, toDist: targetDist, curDist: targetDist,
-          start: performance.now(), dur: VEHICLE_UPDATE_MS,
-          fromPos: target, prevDist: targetDist, _lastDeg: null,
+          marker, routeId, vehicle: v, hasDist,
+          reportPos: rawTarget, reportTime, reportDist,
+          estMps: speed != null ? speed : 0, forward: true,
+          status: current_status, apiBearing: bearing, _lastDeg: bearing ?? null,
         });
-        // initial heading from the API bearing until it starts moving
-        if (hasDist && targetDist != null) marker.setIcon(buildVehicleIcon(v, v.attributes.bearing ?? headingForState(routeId, targetDist, true)));
       }
     });
     interp.forEach((st, id) => { if (!seen.has(id)) { if (st.marker) vehicleLayer.removeLayer(st.marker); interp.delete(id); } });
     startAnimation();
   };
 
+  // Resolve a vehicle's next stop name and its trip destination (headsign) from
+  // the included data (works for both socket and direct-API payloads).
+  const vehicleContextText = (v) => {
+    const inc = new Map((allVehicleData.included || []).map((i) => [`${i.type}:${i.id}`, i]));
+    const stopId = v.relationships.stop?.data?.id;
+    const tripId = v.relationships.trip?.data?.id;
+    const nextStop =
+      stopIdToName.get(stopId) ||
+      inc.get(`stop:${stopId}`)?.attributes?.name ||
+      (inc.get(`stop:${stopId}`)?.relationships?.parent_station?.data?.id &&
+        stopIdToName.get(inc.get(`stop:${stopId}`).relationships.parent_station.data.id)) ||
+      null;
+    const headsign = inc.get(`trip:${tripId}`)?.attributes?.headsign || null;
+    return { nextStop, headsign };
+  };
+
   const updateVehicleTooltip = (marker, v, type) => {
     const crrc = isCrrcVehicle(v);
-    const stopId = v.relationships.stop?.data?.id;
-    const nextStop = stopIdToName.get(stopId);
     const status = (v.attributes.current_status || "").replace(/_/g, " ").toLowerCase();
-    // richer hover tooltip
+    const { nextStop, headsign } = vehicleContextText(v);
+    // Prefer showing the destination; add the next stop with status when known.
+    let line2 = "";
+    if (nextStop) line2 = `${status || "next"}: ${nextStop}`;
+    else if (headsign) line2 = `${status} · to ${headsign}`;
+    else if (status) line2 = status;
+    const destLine = headsign && nextStop ? `<br><span style="opacity:.6">→ ${headsign}</span>` : "";
     const text = isDeveloperMode
       ? v.id
-      : `<b>${crrc ? "✦ " : ""}Train ${v.attributes.label || v.id}</b>${nextStop ? `<br><span style="opacity:.75">${status || "next"}: ${nextStop}</span>` : status ? `<br><span style="opacity:.75">${status}</span>` : ""}`;
+      : `<b>${crrc ? "✦ " : ""}Train ${v.attributes.label || v.id}</b>${line2 ? `<br><span style="opacity:.8">${line2}</span>` : ""}${destLine}`;
     const opts = { className: "vehicle-hover-tooltip", permanent: type === "Commuter Rail", direction: "right", offset: [12, 0] };
     if (type === "Commuter Rail") opts.className += " cr-vehicle-tooltip";
     marker.unbindTooltip(); marker.bindTooltip(text, opts);
   };
 
-  const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  // Bearing (deg from north, clockwise) from point a to point b.
+  const bearingBetween = (a, b) => {
+    const toR = (d) => (d * Math.PI) / 180, toD = (r) => (r * 180) / Math.PI;
+    const y = Math.sin(toR(b[1] - a[1])) * Math.cos(toR(b[0]));
+    const x = Math.cos(toR(a[0])) * Math.sin(toR(b[0])) - Math.sin(toR(a[0])) * Math.cos(toR(b[0])) * Math.cos(toR(b[1] - a[1]));
+    return (toD(Math.atan2(y, x)) + 360) % 360;
+  };
 
   const animateVehicles = () => {
-    const now = performance.now();
+    const nowMs = Date.now();
     interp.forEach((st) => {
       if (!st.marker) return;
-      const t = Math.min(1, (now - st.start) / st.dur);
-      if (st.hasDist && st.toDist != null && st.fromDist != null) {
-        // Interpolate ONLY within [fromDist, toDist]. We ease toward the target
-        // and, for a moving train, also let a speed-based glide close the gap
-        // faster — but both are CLAMPED to the target so the marker can never
-        // shoot past and then reverse. This kills the arrow-flip / wrong-way look.
-        const span = st.toDist - st.fromDist;
-        let frac = easeInOut(t);
-        if (Math.abs(span) > 0.001 && st.kmPerMin > 0.01) {
-          // how far speed alone would have carried us this leg, as a fraction
-          const speedFrac = (st.kmPerMin * ((now - st.start) / 60000)) / Math.abs(span);
-          frac = Math.max(frac, Math.min(1, speedFrac));
-        }
-        frac = Math.max(0, Math.min(1, frac)); // never leave the segment
-        const newDist = st.fromDist + span * frac;
+      // FORWARD PREDICTION (dead reckoning): project from the report's own
+      // timestamp so the marker shows where the train IS NOW, not where it was.
+      // elapsed = wall-clock since the report (which is often 20–90s stale).
+      const elapsed = Math.min(MAX_PREDICT_S, Math.max(0, (nowMs - st.reportTime) / 1000));
+      // Speed: estimated from reports (m/s). STOPPED trains decay to ~0 as they
+      // dwell, but we don't hard-freeze (status lags position in the feed).
+      let mps = st.estMps || 0;
+      if (st.status === "STOPPED_AT") mps = Math.min(mps, 1.5) * Math.max(0, 1 - elapsed / 30);
 
-        // Heading from ACTUAL movement direction this frame (not stale state).
-        const delta = newDist - (st.prevDist ?? newDist);
-        if (Math.abs(delta) > 1e-4) {
-          const forward = delta >= 0;
-          const deg = headingForState(st.routeId, newDist, forward);
-          if (deg != null && (st._lastDeg == null || angleDiff(st._lastDeg, deg) > 4)) {
-            st._lastDeg = deg;
-            st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
-            reapplyTooltip(st);
-          }
+      let pos;
+      if (st.hasDist && st.reportDist != null) {
+        let dist = st.reportDist + (st.forward ? 1 : -1) * (mps * elapsed) / 1000; // km
+        // Don't sail through the next station: clamp to it in the travel direction.
+        const ns = nextStopDist(st.routeId, st.reportDist, st.forward);
+        if (ns != null) dist = st.forward ? Math.min(dist, ns) : Math.max(dist, ns);
+        pos = positionAtDistance(st.routeId, dist) || st.reportPos;
+        // Heading along the track in travel direction.
+        const deg = headingForState(st.routeId, dist, st.forward) ?? st.apiBearing;
+        if (deg != null && (st._lastDeg == null || angleDiff(st._lastDeg, deg) > 8)) {
+          st._lastDeg = deg; st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
         }
-        st.prevDist = newDist;
-        st.curDist = newDist;
-        const pos = positionAtDistance(st.routeId, newDist);
-        if (pos) st.marker.setLatLng(pos);
       } else {
-        // Fallback: straight lerp between raw positions (routes without a
-        // distance model), also clamped so it can't overshoot.
-        const a = st.fromPos || st.rawTarget, b = st.rawTarget;
-        const e = easeInOut(t);
-        const lat = (a.lat ?? a[0]) + ((b[0]) - (a.lat ?? a[0])) * e;
-        const lng = (a.lng ?? a[1]) + ((b[1]) - (a.lng ?? a[1])) * e;
-        st.marker.setLatLng([lat, lng]);
+        // No route geometry: project along bearing (straight-line dead reckon).
+        const m = mps * elapsed;
+        const brg = (st.apiBearing ?? 0) * Math.PI / 180;
+        const dLat = (m * Math.cos(brg)) / 111320;
+        const dLng = (m * Math.sin(brg)) / (111320 * Math.cos(st.reportPos[0] * Math.PI / 180));
+        pos = [st.reportPos[0] + dLat, st.reportPos[1] + dLng];
       }
+      st.marker.setLatLng(pos);
     });
     animationFrame = interp.size > 0 ? requestAnimationFrame(animateVehicles) : null;
   };
   // Smallest absolute difference between two angles in degrees (0..180).
   const angleDiff = (a, b) => { let d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; };
   const reapplyTooltip = (st) => {
+    // Only rebuild the tooltip HTML when the vehicle object actually changed,
+    // not on every heading tweak (which was thrashing bind/unbind each frame).
+    if (st._tooltipVehicle === st.vehicle) return;
+    st._tooltipVehicle = st.vehicle;
     const { type } = getRouteStyle(st.routeId);
     updateVehicleTooltip(st.marker, st.vehicle, type);
   };
-  const startAnimation = () => { if (!animationFrame && interp.size > 0) animationFrame = requestAnimationFrame(animateVehicles); };
+  const startAnimation = () => {
+    if (animationFrame == null && interp.size > 0) animationFrame = requestAnimationFrame(animateVehicles);
+  };
+  // Re-arm the animation loop whenever the tab becomes visible again — rAF is
+  // suspended in background tabs and can otherwise stay stopped after focus.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) { animationFrame = null; startAnimation(); }
+  });
 
   /* ============================================================
      DELAY + VEHICLE PANEL + TRIP TRACKER
@@ -844,17 +1046,34 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!c) return;
     if (!res || !res.predictions || !res.predictions.length) { c.innerHTML = `<p class="empty-note">No trip data available.</p>`; return; }
     const seq = v.attributes.current_stop_sequence, inc = res.included;
-    c.innerHTML = res.predictions.map((p) => {
+    const routeId = v.relationships.route.data.id;
+    // Pre-resolve names; then fill any downstream stop lacking a live prediction
+    // with a learned-segment estimate chained from the previous known time.
+    const rows = res.predictions.map((p) => {
       const sid = p.relationships?.stop?.data?.id;
-      const name = inc.get(`stop:${sid}`)?.attributes?.name || stopIdToName.get(sid) || sid || "Stop";
-      const s = p.attributes.stop_sequence;
-      const t = p.attributes.arrival_time || p.attributes.departure_time;
-      const passed = s < seq, current = s === seq;
-      const timeStr = current ? "Here" : passed ? "" : (formatArrivalTime(t) || clockTime(t));
+      return {
+        name: inc.get(`stop:${sid}`)?.attributes?.name || stopIdToName.get(sid) || sid || "Stop",
+        s: p.attributes.stop_sequence,
+        t: p.attributes.arrival_time || p.attributes.departure_time,
+      };
+    });
+    let lastMs = null;
+    rows.forEach((r) => {
+      if (r.t) { lastMs = new Date(r.t).getTime(); r.est = false; }
+      else if (lastMs != null) {
+        const prev = rows[rows.indexOf(r) - 1];
+        const seg = prev ? learnedSegmentSeconds(routeId, prev.name, r.name) : null;
+        if (seg) { lastMs += seg * 1000; r.t = new Date(lastMs).toISOString(); r.est = true; }
+      }
+    });
+    c.innerHTML = rows.map((r) => {
+      const passed = r.s < seq, current = r.s === seq;
+      let timeStr = current ? "Here" : passed ? "" : (formatArrivalTime(r.t) || clockTime(r.t) || "");
+      if (r.est && timeStr) timeStr += "*"; // learned-estimate marker
       return `<div class="trip-stop ${passed ? "passed" : current ? "current" : ""}">
         <div class="dot-col"><span class="t-dot" style="background:${passed ? "#6b6b73" : color}"></span>
         <span class="t-line" style="background:${passed ? "#2a2a30" : color}"></span></div>
-        <span class="t-name">${name}</span><span class="t-time">${timeStr}</span></div>`;
+        <span class="t-name">${r.name}</span><span class="t-time">${timeStr}</span></div>`;
     }).join("");
   };
 
@@ -1342,8 +1561,16 @@ document.addEventListener("DOMContentLoaded", function () {
     allRouteLayers.forEach((layers, id) => {
       const sel = id === selectedRouteId;
       if (layers.shapes) { layers.shapes.eachLayer((l) => { if (l._isVisibleLine) l.setStyle({ weight: sel ? 6 : 3, opacity: sel ? 0.95 : 0.4 }); }); if (sel) layers.shapes.bringToFront(); }
-      if (layers.stops) { layers.stops.eachLayer((l) => l.setStyle && l.setStyle({ radius: sel ? (l.options.weight > 2 ? 6.5 : 5) : 3, opacity: sel ? 1 : 0.45, fillOpacity: sel ? 1 : 0.45 })); if (sel) layers.stops.bringToFront(); }
     });
+    // Brighten stations on the selected route; dim the rest.
+    const onRoute = new Set(routeStationOrder.get(routeId) || []);
+    stationMarkers.forEach((m, name) => {
+      const on = onRoute.has(name);
+      m.setStyle({ radius: on ? (m._isTransfer ? 7 : 5.5) : (m._isTransfer ? 5 : 3.5), opacity: on ? 1 : 0.4, fillOpacity: on ? 1 : 0.4 });
+    });
+    // Re-assert station dots above the just-fronted route line so they keep
+    // winning clicks on their small hit areas (line stays clickable elsewhere).
+    stationMarkers.forEach((m) => m.bringToFront && m.bringToFront());
 
     const selLayers = allRouteLayers.get(routeId);
     if (showInfo && selLayers?.shapes?.getLayers().length) map.flyToBounds(selLayers.shapes.getBounds().pad(0.1), { animate: true, duration: 0.75 });
@@ -1394,8 +1621,9 @@ document.addEventListener("DOMContentLoaded", function () {
     qsa(".list-row").forEach((a) => a.classList.remove("active"));
     allRouteLayers.forEach((layers) => {
       if (layers.shapes) layers.shapes.eachLayer((l) => { if (l._isVisibleLine) l.setStyle({ weight: 3, opacity: 0.4 }); });
-      if (layers.stops) layers.stops.eachLayer((l) => l.setStyle && l.setStyle({ radius: 3, opacity: 0.45, fillOpacity: 0.45 }));
     });
+    // Reset all stations to their default look.
+    stationMarkers.forEach((m) => m.setStyle({ radius: m._isTransfer ? 6 : 4.5, opacity: 0.95, fillOpacity: 1 }));
     setLineVisibility();
   };
 
@@ -1423,6 +1651,7 @@ document.addEventListener("DOMContentLoaded", function () {
     isDeveloperMode = e.target.checked;
     const cur = selectedRouteId; deselectAll();
     allRouteLayers.forEach((layers, id) => { const info = routeInfoCache.get(id); if (info) drawRoute(id, info, true); });
+    drawAllStations();
     onSearchOrTabChange(); if (cur) selectRoute(cur);
   });
   el.crrcToggle.addEventListener("change", (e) => {
