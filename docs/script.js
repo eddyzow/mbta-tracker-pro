@@ -958,11 +958,11 @@ document.addEventListener("DOMContentLoaded", function () {
     return (toD(Math.atan2(y, x)) + 360) % 360;
   };
 
-  // Max rate the DISPLAYED position is allowed to catch up to the target, in km
-  // of along-track distance per second. This is the reconciliation clamp: like
-  // game client-prediction, the marker eases toward the corrected target and
-  // never teleports/snaps — even when a report flips status or jumps.
-  const RECONCILE_KM_PER_S = 0.45; // ~1600 m over ~3.5s worst case
+  // Reconciliation tuning. The DISPLAYED position eases toward the dead-reckoned
+  // target very gently so corrections never look like a snap/dash — even when a
+  // predicted-stopped train suddenly reports far ahead.
+  const RECONCILE_KM_PER_S = 0.18;   // hard cap on correction speed (~gentle)
+  const RECONCILE_TAU_S = 6;         // time-constant: close the gap over ~6s, not 2.5s
 
   let lastFrameMs = null;
   const animateVehicles = () => {
@@ -998,8 +998,9 @@ document.addEventListener("DOMContentLoaded", function () {
           const BRAKE_KM = 0.25;
           if (toStopKm < BRAKE_KM) baseKmS *= Math.max(0.12, toStopKm / BRAKE_KM);
         }
-        // correction proportional to the gap (~closes it over ~2.5s), capped.
-        let corrKmS = gapKm / 2.5;
+        // correction proportional to the gap (closes it over ~RECONCILE_TAU_S),
+        // capped low so catch-up stays gentle rather than a dash.
+        let corrKmS = gapKm / RECONCILE_TAU_S;
         corrKmS = Math.max(-RECONCILE_KM_PER_S, Math.min(RECONCILE_KM_PER_S, corrKmS));
         // effective forward speed = base + correction, never negative (no reversing).
         let stepKm = Math.max(0, baseKmS + corrKmS) * frameDt;
@@ -1028,12 +1029,16 @@ document.addEventListener("DOMContentLoaded", function () {
         const pos = positionAtDistance(st.routeId, st.displayDist) || st.reportPos;
         st.marker.setLatLng(pos);
 
-        // Heading follows the fixed travel direction (stable, never flips wrong).
-        if (stepKm > 1e-6) {
-          const deg = headingForState(st.routeId, st.displayDist, st.forward) ?? st.apiBearing;
-          if (deg != null && (st._lastDeg == null || angleDiff(st._lastDeg, deg) > 10)) {
-            st._lastDeg = deg; st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
-          }
+        // Heading: while moving, follow the track tangent in the travel
+        // direction; while stopped (real or predicted), use the reported API
+        // bearing (which reflects the train's actual facing) instead of a stale
+        // frozen tangent — so a stopped train doesn't point the wrong way.
+        const movingNow = stepKm > 0.0008; // >~0.8m this frame
+        let deg;
+        if (movingNow) deg = headingForState(st.routeId, st.displayDist, st.forward) ?? st.apiBearing;
+        else deg = st.apiBearing ?? headingForState(st.routeId, st.displayDist, st.forward);
+        if (deg != null && (st._lastDeg == null || angleDiff(st._lastDeg, deg) > 10)) {
+          st._lastDeg = deg; st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
         }
       } else {
         // No route geometry: ease raw lat/lng toward the reported point.
@@ -1117,33 +1122,32 @@ document.addEventListener("DOMContentLoaded", function () {
     plotVehicles(getVehiclesForSelection(), allVehicleData.included);
   };
 
-  // Draw prev/current/next stop rings around the watched train so its immediate
-  // context on the line is obvious.
+  // Highlight the watched train's prev/current/next STATIONS by enlarging their
+  // existing dots (no separate rings). Tracks which were highlighted so we can
+  // reset them when the selection changes or clears.
+  let _highlightedStations = [];
+  const clearStationHighlights = () => {
+    _highlightedStations.forEach((m) => {
+      const e = m.getElement && m.getElement();
+      if (e) { const d = e.querySelector(".station-dot"); if (d) d.classList.remove("hl"); }
+    });
+    _highlightedStations = [];
+  };
   const drawVehicleContext = (v, res) => {
-    vehicleCtxLayer.clearLayers();
+    clearStationHighlights();
     if (selectedVehicleId !== v.id || !res || !res.predictions) return;
-    const { color } = getRouteStyle(v.relationships.route.data.id);
     const seq = v.attributes.current_stop_sequence;
     const inc = res.included;
     const sorted = res.predictions.slice().sort((a, b) => a.attributes.stop_sequence - b.attributes.stop_sequence);
     const idx = sorted.findIndex((p) => p.attributes.stop_sequence >= seq);
-    const pick = [sorted[idx - 1], sorted[idx], sorted[idx + 1]].filter(Boolean);
-    const routeId = v.relationships.route.data.id;
-    pick.forEach((p, i) => {
+    [sorted[idx - 1], sorted[idx], sorted[idx + 1]].filter(Boolean).forEach((p) => {
       const sid = p.relationships?.stop?.data?.id;
-      const stopObj = inc.get(`stop:${sid}`);
-      const name = stopObj?.attributes?.name || stopIdToName.get(sid);
-      // Use the SAME canonical on-track point as the white station dot, so the
-      // ring lands exactly on the station marker (not the raw offset platform GPS).
-      const raw = stopObj?.attributes ? [stopObj.attributes.latitude, stopObj.attributes.longitude] : graph.get(name)?.location;
-      if (!raw || raw[0] == null) return;
-      const stMarker = stationMarkers.get(name);
-      const loc = stMarker ? [stMarker.getLatLng().lat, stMarker.getLatLng().lng]
-        : stationTrackPoint(name, [routeId], raw);
-      const isNext = i === pick.length - 1 && p.attributes.stop_sequence >= seq;
-      L.circleMarker(loc, {
-        radius: 9, color, weight: 3, fillColor: color, fillOpacity: 0.15, className: isNext ? "ctx-ring" : "",
-      }).addTo(vehicleCtxLayer).bindTooltip(name || "", { direction: "top", offset: [0, -8], className: "station-name-tooltip", permanent: true });
+      const name = inc.get(`stop:${sid}`)?.attributes?.name || stopIdToName.get(sid);
+      const m = name && stationMarkers.get(name);
+      if (!m) return;
+      const e = m.getElement && m.getElement();
+      const d = e && e.querySelector(".station-dot");
+      if (d) { d.classList.add("hl"); _highlightedStations.push(m); }
     });
   };
 
@@ -1173,7 +1177,7 @@ document.addEventListener("DOMContentLoaded", function () {
     el.vehicleInfo.classList.remove("hidden");
     el.vehicleInfo.querySelector(".close-button").onclick = () => {
       selectedVehicleId = null; _shellVehicleId = null; el.vehicleInfo.classList.add("hidden");
-      vehicleCtxLayer.clearLayers();
+      clearStationHighlights();
       plotVehicles(getVehiclesForSelection(), allVehicleData.included);
     };
   };
@@ -1836,8 +1840,8 @@ document.addEventListener("DOMContentLoaded", function () {
     lastClickedShapeId = null;
     if (!soft || isDeveloperMode) qsa(".info-overlay").forEach((p) => p.classList.add("hidden"));
     if (soft) return;
-    selectedRouteId = null; selectedVehicleId = null;
-    vehicleLayer.clearLayers(); interp.clear(); vehicleCtxLayer.clearLayers();
+    selectedRouteId = null; selectedVehicleId = null; _shellVehicleId = null;
+    vehicleLayer.clearLayers(); interp.clear(); clearStationHighlights();
     qsa(".list-row").forEach((a) => a.classList.remove("active"));
     allRouteLayers.forEach((layers) => {
       if (layers.shapes) layers.shapes.eachLayer((l) => { if (l._isVisibleLine) l.setStyle({ weight: 3, opacity: 0.4 }); });
