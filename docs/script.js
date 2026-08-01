@@ -1001,6 +1001,20 @@ document.addEventListener("DOMContentLoaded", function () {
         if (stepKm > Math.abs(targetDist - st.displayDist)) stepKm = Math.abs(targetDist - st.displayDist);
         st.displayDist += dir * stepKm;
 
+        // Predicted-stop: the model says the train has reached its next station
+        // (clamped to it) but the last report still says in-transit. Flag it so
+        // the UI can show "stopped (predicted)".
+        const wasPred = st.predictedStopped;
+        st.predictedStopped = ns != null && Math.abs(ns - st.displayDist) < 0.03 &&
+          st.status !== "STOPPED_AT" && targetDist === ns;
+        // When it flips and this is the watched train, refresh the panel status.
+        if (st.predictedStopped !== wasPred && st.vehicle.id === selectedVehicleId) {
+          const el2 = getEl("veh-status");
+          if (el2) el2.textContent = st.predictedStopped
+            ? "stopped (predicted)"
+            : (st.status || "").replace(/_/g, " ").toLowerCase();
+        }
+
         const pos = positionAtDistance(st.routeId, st.displayDist) || st.reportPos;
         st.marker.setLatLng(pos);
 
@@ -1104,12 +1118,18 @@ document.addEventListener("DOMContentLoaded", function () {
     const sorted = res.predictions.slice().sort((a, b) => a.attributes.stop_sequence - b.attributes.stop_sequence);
     const idx = sorted.findIndex((p) => p.attributes.stop_sequence >= seq);
     const pick = [sorted[idx - 1], sorted[idx], sorted[idx + 1]].filter(Boolean);
+    const routeId = v.relationships.route.data.id;
     pick.forEach((p, i) => {
       const sid = p.relationships?.stop?.data?.id;
       const stopObj = inc.get(`stop:${sid}`);
       const name = stopObj?.attributes?.name || stopIdToName.get(sid);
-      const loc = stopObj?.attributes ? [stopObj.attributes.latitude, stopObj.attributes.longitude] : graph.get(name)?.location;
-      if (!loc || loc[0] == null) return;
+      // Use the SAME canonical on-track point as the white station dot, so the
+      // ring lands exactly on the station marker (not the raw offset platform GPS).
+      const raw = stopObj?.attributes ? [stopObj.attributes.latitude, stopObj.attributes.longitude] : graph.get(name)?.location;
+      if (!raw || raw[0] == null) return;
+      const stMarker = stationMarkers.get(name);
+      const loc = stMarker ? [stMarker.getLatLng().lat, stMarker.getLatLng().lng]
+        : stationTrackPoint(name, [routeId], raw);
       const isNext = i === pick.length - 1 && p.attributes.stop_sequence >= seq;
       L.circleMarker(loc, {
         radius: 9, color, weight: 3, fillColor: color, fillOpacity: 0.15, className: isNext ? "ctx-ring" : "",
@@ -1167,7 +1187,10 @@ document.addEventListener("DOMContentLoaded", function () {
 
     // Update only the dynamic fields in place (never touches #trip-timeline).
     set("veh-sub", routeLongName(routeId) + (headsign ? " → " + headsign : ""));
-    set("veh-status", (current_status || "").replace(/_/g, " ").toLowerCase());
+    const st = interp.get(v.id);
+    set("veh-status", st && st.predictedStopped && current_status !== "STOPPED_AT"
+      ? "stopped (predicted)"
+      : (current_status || "").replace(/_/g, " ").toLowerCase());
     set("veh-next", nextStop);
     set("veh-updated", formatRelativeTime(updated_at));
     if (speed != null) { getEl("veh-speed-row").style.display = ""; set("veh-speed", Math.round(speed * 2.237) + " mph"); }
@@ -1204,7 +1227,7 @@ document.addEventListener("DOMContentLoaded", function () {
     const routeId = v.relationships.route.data.id;
     // Pre-resolve names; then fill any downstream stop lacking a live prediction
     // with a learned-segment estimate chained from the previous known time.
-    const rows = res.predictions.map((p) => {
+    let rows = res.predictions.map((p) => {
       const sid = p.relationships?.stop?.data?.id;
       return {
         name: inc.get(`stop:${sid}`)?.attributes?.name || stopIdToName.get(sid) || sid || "Stop",
@@ -1212,6 +1235,16 @@ document.addEventListener("DOMContentLoaded", function () {
         t: p.attributes.arrival_time || p.attributes.departure_time,
       };
     });
+    // Dedupe consecutive stops with the same NAME (a line and its branch variant,
+    // e.g. Franklin vs Franklin/Foxboro, list the same platform twice). Keep the
+    // first occurrence, preferring one that has a time.
+    const deduped = [];
+    rows.forEach((r) => {
+      const last = deduped[deduped.length - 1];
+      if (last && last.name === r.name) { if (!last.t && r.t) last.t = r.t; return; }
+      deduped.push(r);
+    });
+    rows = deduped;
     let lastMs = null;
     rows.forEach((r) => {
       if (r.t) { lastMs = new Date(r.t).getTime(); r.est = false; }
