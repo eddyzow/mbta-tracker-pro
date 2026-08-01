@@ -228,8 +228,33 @@ document.addEventListener("DOMContentLoaded", function () {
     routeCumDist.set(routeId, { pts, cum });
   };
 
-  // Precompute where each stop falls along the route line, so a predicted train
-  // can be clamped to the NEXT stop instead of sailing through it.
+  // Ground-truth stop positions (median lat/lng where trains actually reported
+  // STOPPED_AT). Refined live as new STOPPED reports arrive.
+  const STOP_POSITIONS = Object.assign({}, window.MBTA_STOP_POSITIONS || {});
+
+  // THE canonical on-track point for a station — used for the marker, the
+  // next-stop clamp, AND matching where a train actually stops, so all three are
+  // the SAME point (this is what stops trains from jumping backward at stations).
+  // Priority: observed STOPPED position (snapped to track) > concourse location.
+  const stationTrackPoint = (name, routes, fallbackLatLng) => {
+    const src = STOP_POSITIONS[name]
+      ? STOP_POSITIONS[name]
+      : [fallbackLatLng.lat ?? fallbackLatLng[0], fallbackLatLng.lng ?? fallbackLatLng[1]];
+    let best = null, bestDist = Infinity;
+    (routes || []).forEach((rId) => {
+      (routeAllShapePts.get(rId) || []).forEach((pts) => {
+        for (let i = 0; i < pts.length - 1; i++) {
+          const proj = projectOnSegment(src, pts[i], pts[i + 1]).point;
+          const d = haversine(src, proj);
+          if (d < bestDist) { bestDist = d; best = proj; }
+        }
+      });
+    });
+    return best && bestDist < 0.4 ? best : src;
+  };
+
+  // Precompute where each stop falls along the route line (from the SAME canonical
+  // track point as the marker), so the next-stop clamp lines up with the marker.
   const buildRouteStopDists = (routeId, stops) => {
     if (!routeCumDist.has(routeId) || !stops) return;
     const ds = [];
@@ -238,7 +263,8 @@ document.addEventListener("DOMContentLoaded", function () {
       const { name, latitude, longitude } = s.attributes;
       if (seen.has(name) || latitude == null) return;
       seen.add(name);
-      const d = distanceAlongRoute(routeId, [latitude, longitude]);
+      const tp = stationTrackPoint(name, [routeId], [latitude, longitude]);
+      const d = distanceAlongRoute(routeId, tp);
       if (d != null) ds.push(d);
     });
     ds.sort((a, b) => a - b);
@@ -340,6 +366,17 @@ document.addEventListener("DOMContentLoaded", function () {
     return (toD(Math.atan2(y, x)) + 360) % 360;
   };
 
+  const angleDelta = (a, b) => { let d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; };
+  // Which way along the track is the train travelling, inferred from its reported
+  // compass bearing vs the track's increasing-distance tangent. Used on the FIRST
+  // report (no movement history yet) so trains don't start off going backward.
+  const forwardFromBearing = (routeId, dist, apiBearing) => {
+    if (apiBearing == null) return true;
+    const tangent = bearingAtDistance(routeId, dist);
+    if (tangent == null) return true;
+    return angleDelta(apiBearing, tangent) <= 90; // within 90° of "increasing" = forward
+  };
+
   /* ============================================================
      DIRECT MBTA API CLIENT
      ============================================================ */
@@ -349,9 +386,16 @@ document.addEventListener("DOMContentLoaded", function () {
       Object.entries(params).forEach(([k, v]) => {
         if (v !== undefined && v !== null) url.searchParams.set(k, v);
       });
-      const res = await fetch(url.toString(), { headers: { Accept: "application/json" } });
-      if (!res.ok) throw new Error(`MBTA API ${res.status} on ${path}`);
-      return res.json();
+      // Abort after 8s so a slow/hung request never leaves the UI stuck loading.
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 8000);
+      try {
+        const res = await fetch(url.toString(), { headers: { Accept: "application/json" }, signal: ctrl.signal });
+        if (!res.ok) throw new Error(`MBTA API ${res.status} on ${path}`);
+        return await res.json();
+      } finally {
+        clearTimeout(timer);
+      }
     },
     alerts() { return this.get("/alerts", { "filter[datetime]": "NOW" }); },
     vehiclesForRoute(routeId) {
@@ -658,23 +702,10 @@ document.addEventListener("DOMContentLoaded", function () {
       const isTransfer = data.routes.size > 1;
       const isMajor = majorStations.has(name);
 
-      // Snap the station to the nearest point across ALL of its routes' shapes
-      // (so branch stops, e.g. Red's Ashmont vs Braintree legs, snap correctly
-      // rather than to a single trunk shape).
-      const raw = [data.location.lat, data.location.lng];
-      let best = null, bestDist = Infinity;
-      routes.forEach((rId) => {
-        (routeAllShapePts.get(rId) || []).forEach((pts) => {
-          for (let i = 0; i < pts.length - 1; i++) {
-            const proj = projectOnSegment(raw, pts[i], pts[i + 1]).point;
-            const d = haversine(raw, proj);
-            if (d < bestDist) { bestDist = d; best = proj; }
-          }
-        });
-      });
-      // Only accept the snap if it's within 250 m; otherwise keep raw location
-      // (guards against a stop with no matching shape being flung onto the line).
-      const latlng = best && bestDist < 0.25 ? L.latLng(best[0], best[1]) : data.location;
+      // Canonical on-track point for this station — the SAME point used for the
+      // marker, the next-stop clamp, and where trains stop (see stationTrackPoint).
+      const tp = stationTrackPoint(name, routes, data.location);
+      const latlng = L.latLng(tp[0], tp[1]);
 
       // DOM divIcon marker (marker pane) instead of a canvas circle: it only
       // captures clicks on its small dot, so route lines underneath stay fully
@@ -792,7 +823,24 @@ document.addEventListener("DOMContentLoaded", function () {
       const hasDist = routeCumDist.has(routeId);
       const ex = interp.get(v.id);
       const prevDistHint = ex ? (ex.reportDist != null ? ex.reportDist : null) : null;
-      const reportDist = hasDist ? distanceAlongRoute(routeId, rawTarget, prevDistHint) : null;
+      // When a train reports STOPPED_AT a named station, that GPS is ground truth
+      // for where trains stop there: learn it and snap the train's along-track
+      // position to the station's canonical point, so the marker, the stop clamp,
+      // and the train coincide (kills the backward-jump-at-stations bug).
+      const stopId = v.relationships.stop?.data?.id;
+      const stopName = stopIdToName.get(stopId);
+      let reportDist;
+      if (current_status === "STOPPED_AT" && stopName && hasDist) {
+        // refine the learned stop position toward this report
+        const cur = STOP_POSITIONS[stopName];
+        STOP_POSITIONS[stopName] = cur
+          ? [cur[0] * 0.8 + latitude * 0.2, cur[1] * 0.8 + longitude * 0.2]
+          : [latitude, longitude];
+        const tp = stationTrackPoint(stopName, [routeId], rawTarget);
+        reportDist = distanceAlongRoute(routeId, tp, prevDistHint);
+      } else {
+        reportDist = hasDist ? distanceAlongRoute(routeId, rawTarget, prevDistHint) : null;
+      }
 
       if (ex && ex.marker) {
         // Only treat as a NEW report when updated_at actually advanced.
@@ -821,11 +869,14 @@ document.addEventListener("DOMContentLoaded", function () {
             const sorted = [...ex.speedHist].sort((a, b) => a - b);
             estMps = sorted[Math.floor(sorted.length / 2)]; // median of recent samples
           }
-          // Decide travel direction along the track. Only flip direction on a
-          // clear move (>150m) so noise/branch ambiguity can't reverse the train.
+          // Decide travel direction along the track. A clear move (>150m) sets it
+          // from actual displacement; otherwise fall back to the API bearing so a
+          // (near-)stationary train still faces the right way.
           let forward = ex.forward !== undefined ? ex.forward : true;
           if (hasDist && reportDist != null && ex.reportDist != null && Math.abs(reportDist - ex.reportDist) > 0.15)
             forward = reportDist >= ex.reportDist;
+          else if (hasDist && reportDist != null && bearing != null)
+            forward = forwardFromBearing(routeId, reportDist, bearing);
           ex.reportPos = rawTarget;
           ex.reportTime = reportTime;
           ex.reportDist = reportDist;
@@ -840,10 +891,13 @@ document.addEventListener("DOMContentLoaded", function () {
         updateVehicleTooltip(marker, v, type);
         marker.on("click", (e) => { L.DomEvent.stop(e); displayVehicleDetails(marker); });
         marker.addTo(vehicleLayer);
+        // First report: infer travel direction from the API bearing so the train
+        // doesn't start off dead-reckoning the wrong way.
+        const initForward = hasDist && reportDist != null ? forwardFromBearing(routeId, reportDist, bearing) : true;
         interp.set(v.id, {
           marker, routeId, vehicle: v, hasDist,
           reportPos: rawTarget, reportTime, reportDist,
-          estMps: speed != null ? speed : 0, forward: true,
+          estMps: speed != null ? speed : 0, forward: initForward,
           status: current_status, apiBearing: bearing, _lastDeg: bearing ?? null,
         });
       }
@@ -918,21 +972,37 @@ document.addEventListener("DOMContentLoaded", function () {
         const ns = nextStopDist(st.routeId, st.reportDist, st.forward);
         if (ns != null) targetDist = st.forward ? Math.min(targetDist, ns) : Math.max(targetDist, ns);
 
-        // 2) DISPLAY eases toward target, clamped so it can't jump/reverse.
+        // 2) DISPLAY moves at the train's own speed, GRADUALLY sped up or slowed
+        // down to close the gap to the target — a smooth rubber-band, never a
+        // snap. gap>0 means the truth is ahead (speed up); gap<0 means we're ahead
+        // of the truth (slow down / briefly hold).
         if (st.displayDist == null) st.displayDist = targetDist;
-        let delta = targetDist - st.displayDist;
-        const maxStep = RECONCILE_KM_PER_S * frameDt;
-        if (Math.abs(delta) > maxStep) delta = Math.sign(delta) * maxStep;
-        st.displayDist += delta;
+        const dir = st.forward ? 1 : -1;
+        const gapKm = (targetDist - st.displayDist) * dir; // + = target ahead of us
+        let baseKmS = mps / 1000;
+        // Decelerate approaching the next station: within ~250m, taper speed down
+        // so the train eases in. If the next report says STOPPED we're already
+        // near-stopped (no rebound); if it skips, we haven't overshot much.
+        if (ns != null) {
+          const toStopKm = Math.abs(ns - st.displayDist);
+          const BRAKE_KM = 0.25;
+          if (toStopKm < BRAKE_KM) baseKmS *= Math.max(0.12, toStopKm / BRAKE_KM);
+        }
+        // correction proportional to the gap (~closes it over ~2.5s), capped.
+        let corrKmS = gapKm / 2.5;
+        corrKmS = Math.max(-RECONCILE_KM_PER_S, Math.min(RECONCILE_KM_PER_S, corrKmS));
+        // effective forward speed = base + correction, never negative (no reversing).
+        let stepKm = Math.max(0, baseKmS + corrKmS) * frameDt;
+        // don't overshoot the target this frame.
+        if (stepKm > Math.abs(targetDist - st.displayDist)) stepKm = Math.abs(targetDist - st.displayDist);
+        st.displayDist += dir * stepKm;
 
         const pos = positionAtDistance(st.routeId, st.displayDist) || st.reportPos;
         st.marker.setLatLng(pos);
 
-        // Heading from the DISPLAYED motion direction (smooth, never flips wrong).
-        const movingFwd = delta >= 0;
-        // Only update heading when actually moving a meaningful amount this frame.
-        if (Math.abs(delta) > 1e-5) {
-          const deg = headingForState(st.routeId, st.displayDist, movingFwd) ?? st.apiBearing;
+        // Heading follows the fixed travel direction (stable, never flips wrong).
+        if (stepKm > 1e-6) {
+          const deg = headingForState(st.routeId, st.displayDist, st.forward) ?? st.apiBearing;
           if (deg != null && (st._lastDeg == null || angleDiff(st._lastDeg, deg) > 10)) {
             st._lastDeg = deg; st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
           }
@@ -1092,6 +1162,14 @@ document.addEventListener("DOMContentLoaded", function () {
         renderTripTimeline(v, res, color);
         drawVehicleContext(v, res);
         plotVehicles(getVehiclesForSelection(), allVehicleData.included);
+      }).catch(() => {
+        // On failure (rate limit / network) don't hang on "Loading trip…":
+        // show a message and clear the key so the next refresh retries.
+        if (selectedVehicleId === v.id) {
+          const c = getEl("trip-timeline");
+          if (c) c.innerHTML = `<p class="empty-note">Trip data unavailable — retrying…</p>`;
+        }
+        _lastTripKey = null;
       });
     }
   };
