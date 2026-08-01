@@ -223,12 +223,38 @@ document.addEventListener("DOMContentLoaded", function () {
   // advance ALONG the tracks by (speed × elapsed), instead of a straight lerp
   // that cuts across corners.
   const routeCumDist = new Map(); // routeId -> { pts:[[lat,lng]], cum:[km] }
+  const routeStopDists = new Map(); // routeId -> sorted [km] of stop positions along the line
 
   const buildRouteDistances = (routeId, pts) => {
     if (!pts || pts.length < 2) return;
     const cum = [0];
     for (let i = 1; i < pts.length; i++) cum[i] = cum[i - 1] + haversine(pts[i - 1], pts[i]);
     routeCumDist.set(routeId, { pts, cum });
+  };
+
+  // Precompute where each stop falls along the route line, so a predicted train
+  // can be clamped to the NEXT stop instead of sailing through it.
+  const buildRouteStopDists = (routeId, stops) => {
+    if (!routeCumDist.has(routeId) || !stops) return;
+    const ds = [];
+    const seen = new Set();
+    stops.forEach((s) => {
+      const { name, latitude, longitude } = s.attributes;
+      if (seen.has(name) || latitude == null) return;
+      seen.add(name);
+      const d = distanceAlongRoute(routeId, [latitude, longitude]);
+      if (d != null) ds.push(d);
+    });
+    ds.sort((a, b) => a - b);
+    routeStopDists.set(routeId, ds);
+  };
+  // Smallest stop distance strictly greater than `dist` in the travel direction.
+  const nextStopDist = (routeId, dist, forward) => {
+    const ds = routeStopDists.get(routeId);
+    if (!ds || !ds.length) return null;
+    if (forward) { for (const d of ds) if (d > dist + 0.02) return d; return null; }
+    for (let i = ds.length - 1; i >= 0; i--) if (ds[i] < dist - 0.02) return ds[i];
+    return null;
   };
 
   // Nearest distance-along-route (km) to a given latlng. When `hintKm` is given,
@@ -605,7 +631,7 @@ document.addEventListener("DOMContentLoaded", function () {
       pl._isVisibleLine = true;
       layerGroup.shapes.addLayer(pl);
     });
-    if (longest) { routePolylinePts.set(routeId, longest); buildRouteDistances(routeId, longest); }
+    if (longest) { routePolylinePts.set(routeId, longest); buildRouteDistances(routeId, longest); buildRouteStopDists(routeId, stops); }
     routeAllShapePts.set(routeId, finalShapes.map((s) => s.pts));
     // Stations are drawn once, globally, by drawAllStations() — not per route —
     // so transfer stations aren't stacked/duplicated.
@@ -718,48 +744,72 @@ document.addEventListener("DOMContentLoaded", function () {
   // SNAP to it instead of animating a "race across the map".
   const MAX_LEG_KM = 1.6; // ~55 mph over 30s + margin
 
+  const MAX_PREDICT_S = 75;   // cap forward prediction (stale reports don't fling)
+  const MAX_EST_SPEED = 30;   // m/s sanity cap (~67 mph)
+
+  // Ingest a report: record its position + timestamp, estimate speed from the
+  // change since the previous report, and set up the on-route prediction anchor.
   const plotVehicles = (vehicles, included) => {
     if (!vehicles) vehicles = [];
     const seen = new Set();
     vehicles.forEach((v) => {
-      const { latitude, longitude, bearing, current_status } = v.attributes;
+      const { latitude, longitude, bearing, current_status, updated_at, speed } = v.attributes;
       if (latitude == null || longitude == null) return;
       const routeId = v.relationships.route.data.id;
       const { type } = getRouteStyle(routeId);
       seen.add(v.id);
 
       const rawTarget = [latitude, longitude];
-      const stopped = current_status === "STOPPED_AT";
+      const reportTime = updated_at ? new Date(updated_at).getTime() : Date.now();
+      const hasDist = routeCumDist.has(routeId);
       const ex = interp.get(v.id);
+      const prevDistHint = ex ? (ex.reportDist != null ? ex.reportDist : null) : null;
+      const reportDist = hasDist ? distanceAlongRoute(routeId, rawTarget, prevDistHint) : null;
 
       if (ex && ex.marker) {
-        const curPos = ex.marker.getLatLng();
-        const from = [curPos.lat, curPos.lng];
-        const legKm = haversine(from, rawTarget);
-        // Snap (no animation) if: the train is stopped, the move is tiny, or the
-        // move is implausibly large (bad report). Otherwise glide over the update
-        // interval — covering the real gap in the real time = correct speed.
-        const snap = stopped || legKm < 0.004 || legKm > MAX_LEG_KM;
-        ex.from = snap ? rawTarget : from;
-        ex.to = rawTarget;
-        ex.start = performance.now();
-        ex.dur = snap ? 1 : measuredUpdateMs;
-        ex.vehicle = v; ex.routeId = routeId;
-        // Heading: prefer the API bearing; fall back to travel direction.
-        let deg = bearing != null ? bearing : (legKm > 0.01 ? bearingBetween(from, rawTarget) : ex._lastDeg);
-        if (deg != null && (ex._lastDeg == null || angleDiff(ex._lastDeg, deg) > 8)) {
-          ex._lastDeg = deg; ex.marker.setIcon(buildVehicleIcon(v, deg));
+        // Only treat as a NEW report when updated_at actually advanced.
+        const isNewReport = reportTime !== ex.reportTime;
+        if (isNewReport) {
+          // Estimate speed (m/s) from along-track movement since last report.
+          const dtReport = (reportTime - ex.reportTime) / 1000;
+          let estMps = ex.estMps || 0;
+          if (dtReport > 2 && dtReport < 240) {
+            let moved;
+            if (hasDist && reportDist != null && ex.reportDist != null) {
+              moved = Math.abs(reportDist - ex.reportDist) * 1000; // km->m
+              // guard route-ambiguity jumps: fall back to straight-line
+              if (moved > MAX_LEG_KM * 1000) moved = haversine([...(ex.reportPos)], rawTarget) * 1000;
+            } else {
+              moved = haversine(ex.reportPos, rawTarget) * 1000;
+            }
+            const inst = moved / dtReport;
+            // smoothed estimate; prefer API speed when present (CR sometimes has it)
+            const sample = speed != null ? speed : inst;
+            estMps = ex.estMps ? ex.estMps * 0.5 + sample * 0.5 : sample;
+          }
+          // Decide travel direction along the track.
+          let forward = ex.forward !== undefined ? ex.forward : true;
+          if (hasDist && reportDist != null && ex.reportDist != null && Math.abs(reportDist - ex.reportDist) > 0.03)
+            forward = reportDist >= ex.reportDist;
+          ex.reportPos = rawTarget;
+          ex.reportTime = reportTime;
+          ex.reportDist = reportDist;
+          ex.estMps = Math.max(0, Math.min(MAX_EST_SPEED, estMps));
+          ex.forward = forward;
+          ex.status = current_status;
+          ex.apiBearing = bearing;
         }
-        if (snap) ex.marker.setLatLng(rawTarget);
+        ex.vehicle = v; ex.routeId = routeId; ex.hasDist = hasDist;
       } else {
         const marker = L.marker(rawTarget, { icon: buildVehicleIcon(v, bearing), zIndexOffset: 1000, vehicleData: v });
         updateVehicleTooltip(marker, v, type);
         marker.on("click", (e) => { L.DomEvent.stop(e); displayVehicleDetails(marker); });
         marker.addTo(vehicleLayer);
         interp.set(v.id, {
-          marker, routeId, vehicle: v,
-          from: rawTarget, to: rawTarget, start: performance.now(), dur: 1,
-          _lastDeg: bearing != null ? bearing : null,
+          marker, routeId, vehicle: v, hasDist,
+          reportPos: rawTarget, reportTime, reportDist,
+          estMps: speed != null ? speed : 0, forward: true,
+          status: current_status, apiBearing: bearing, _lastDeg: bearing ?? null,
         });
       }
     });
@@ -767,15 +817,35 @@ document.addEventListener("DOMContentLoaded", function () {
     startAnimation();
   };
 
+  // Resolve a vehicle's next stop name and its trip destination (headsign) from
+  // the included data (works for both socket and direct-API payloads).
+  const vehicleContextText = (v) => {
+    const inc = new Map((allVehicleData.included || []).map((i) => [`${i.type}:${i.id}`, i]));
+    const stopId = v.relationships.stop?.data?.id;
+    const tripId = v.relationships.trip?.data?.id;
+    const nextStop =
+      stopIdToName.get(stopId) ||
+      inc.get(`stop:${stopId}`)?.attributes?.name ||
+      (inc.get(`stop:${stopId}`)?.relationships?.parent_station?.data?.id &&
+        stopIdToName.get(inc.get(`stop:${stopId}`).relationships.parent_station.data.id)) ||
+      null;
+    const headsign = inc.get(`trip:${tripId}`)?.attributes?.headsign || null;
+    return { nextStop, headsign };
+  };
+
   const updateVehicleTooltip = (marker, v, type) => {
     const crrc = isCrrcVehicle(v);
-    const stopId = v.relationships.stop?.data?.id;
-    const nextStop = stopIdToName.get(stopId);
     const status = (v.attributes.current_status || "").replace(/_/g, " ").toLowerCase();
-    // richer hover tooltip
+    const { nextStop, headsign } = vehicleContextText(v);
+    // Prefer showing the destination; add the next stop with status when known.
+    let line2 = "";
+    if (nextStop) line2 = `${status || "next"}: ${nextStop}`;
+    else if (headsign) line2 = `${status} · to ${headsign}`;
+    else if (status) line2 = status;
+    const destLine = headsign && nextStop ? `<br><span style="opacity:.6">→ ${headsign}</span>` : "";
     const text = isDeveloperMode
       ? v.id
-      : `<b>${crrc ? "✦ " : ""}Train ${v.attributes.label || v.id}</b>${nextStop ? `<br><span style="opacity:.75">${status || "next"}: ${nextStop}</span>` : status ? `<br><span style="opacity:.75">${status}</span>` : ""}`;
+      : `<b>${crrc ? "✦ " : ""}Train ${v.attributes.label || v.id}</b>${line2 ? `<br><span style="opacity:.8">${line2}</span>` : ""}${destLine}`;
     const opts = { className: "vehicle-hover-tooltip", permanent: type === "Commuter Rail", direction: "right", offset: [12, 0] };
     if (type === "Commuter Rail") opts.className += " cr-vehicle-tooltip";
     marker.unbindTooltip(); marker.bindTooltip(text, opts);
@@ -790,15 +860,39 @@ document.addEventListener("DOMContentLoaded", function () {
   };
 
   const animateVehicles = () => {
-    const now = performance.now();
+    const nowMs = Date.now();
     interp.forEach((st) => {
       if (!st.marker) return;
-      // Linear lerp of RAW lat/lng from last position to the new report over the
-      // update interval. Simple and robust: no distance-along-route ambiguity, so
-      // trains can't teleport/race across the map, and speed = real gap / real time.
-      const t = Math.min(1, (now - st.start) / st.dur);
-      const a = st.from, b = st.to;
-      st.marker.setLatLng([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+      // FORWARD PREDICTION (dead reckoning): project from the report's own
+      // timestamp so the marker shows where the train IS NOW, not where it was.
+      // elapsed = wall-clock since the report (which is often 20–90s stale).
+      const elapsed = Math.min(MAX_PREDICT_S, Math.max(0, (nowMs - st.reportTime) / 1000));
+      // Speed: estimated from reports (m/s). STOPPED trains decay to ~0 as they
+      // dwell, but we don't hard-freeze (status lags position in the feed).
+      let mps = st.estMps || 0;
+      if (st.status === "STOPPED_AT") mps = Math.min(mps, 1.5) * Math.max(0, 1 - elapsed / 30);
+
+      let pos;
+      if (st.hasDist && st.reportDist != null) {
+        let dist = st.reportDist + (st.forward ? 1 : -1) * (mps * elapsed) / 1000; // km
+        // Don't sail through the next station: clamp to it in the travel direction.
+        const ns = nextStopDist(st.routeId, st.reportDist, st.forward);
+        if (ns != null) dist = st.forward ? Math.min(dist, ns) : Math.max(dist, ns);
+        pos = positionAtDistance(st.routeId, dist) || st.reportPos;
+        // Heading along the track in travel direction.
+        const deg = headingForState(st.routeId, dist, st.forward) ?? st.apiBearing;
+        if (deg != null && (st._lastDeg == null || angleDiff(st._lastDeg, deg) > 8)) {
+          st._lastDeg = deg; st.marker.setIcon(buildVehicleIcon(st.vehicle, deg));
+        }
+      } else {
+        // No route geometry: project along bearing (straight-line dead reckon).
+        const m = mps * elapsed;
+        const brg = (st.apiBearing ?? 0) * Math.PI / 180;
+        const dLat = (m * Math.cos(brg)) / 111320;
+        const dLng = (m * Math.sin(brg)) / (111320 * Math.cos(st.reportPos[0] * Math.PI / 180));
+        pos = [st.reportPos[0] + dLat, st.reportPos[1] + dLng];
+      }
+      st.marker.setLatLng(pos);
     });
     animationFrame = interp.size > 0 ? requestAnimationFrame(animateVehicles) : null;
   };
