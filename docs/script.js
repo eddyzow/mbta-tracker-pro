@@ -928,7 +928,13 @@ document.addEventListener("DOMContentLoaded", function () {
 
   const updateVehicleTooltip = (marker, v, type) => {
     const crrc = isCrrcVehicle(v);
-    const status = (v.attributes.current_status || "").replace(/_/g, " ").toLowerCase();
+    // Reflect the predicted-stopped state (kept in interp) so the marker text and
+    // the panel status change together, not one report behind the other.
+    const st = interp.get(v.id);
+    const predStopped = st && st.predictedStopped && v.attributes.current_status !== "STOPPED_AT";
+    const status = predStopped
+      ? "stopped (predicted)"
+      : (v.attributes.current_status || "").replace(/_/g, " ").toLowerCase();
     const { nextStop, headsign } = vehicleContextText(v);
     // Prefer showing the destination; add the next stop with status when known.
     let line2 = "";
@@ -1007,12 +1013,16 @@ document.addEventListener("DOMContentLoaded", function () {
         const wasPred = st.predictedStopped;
         st.predictedStopped = ns != null && Math.abs(ns - st.displayDist) < 0.03 &&
           st.status !== "STOPPED_AT" && targetDist === ns;
-        // When it flips and this is the watched train, refresh the panel status.
-        if (st.predictedStopped !== wasPred && st.vehicle.id === selectedVehicleId) {
-          const el2 = getEl("veh-status");
-          if (el2) el2.textContent = st.predictedStopped
-            ? "stopped (predicted)"
-            : (st.status || "").replace(/_/g, " ").toLowerCase();
+        // When it flips, update the marker tooltip AND (if watched) the panel
+        // status together, so they never disagree.
+        if (st.predictedStopped !== wasPred) {
+          updateVehicleTooltip(st.marker, st.vehicle, getRouteStyle(st.routeId).type);
+          if (st.vehicle.id === selectedVehicleId) {
+            const el2 = getEl("veh-status");
+            if (el2) el2.textContent = st.predictedStopped
+              ? "stopped (predicted)"
+              : (st.status || "").replace(/_/g, " ").toLowerCase();
+          }
         }
 
         const pos = positionAtDistance(st.routeId, st.displayDist) || st.reportPos;
